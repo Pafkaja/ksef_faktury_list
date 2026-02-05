@@ -6,8 +6,24 @@ __pycache__
 *.pem
 *.key
 *.crt
+*.p12
+*.pfx
 README.md
 .env
 .venv
 venv
 *.log
+
+# Tokens and passwords
+token.txt
+haslo.txt
+password.txt
+*.token
+
+# Invoice files (sensitive data)
+*.xml
+
+# Output directories
+output/
+faktury_xml/
+faktury_pdf/

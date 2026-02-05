@@ -27,19 +27,27 @@
 Standalone script for fetching invoices from KSeF (Krajowy System e-Faktur).
 
 KSeF is the Polish National e-Invoice System (Krajowy System e-Faktur).
-This script uses XAdES-BES digital signature authentication with a qualified certificate.
+This script supports two authentication methods:
+- XAdES-BES digital signature with a qualified certificate
+- KSeF authorization token
 
 Usage:
+    # Certificate authentication (XAdES)
     python ksef_faktury_list.py --nip 1234567890 --cert cert.pem --key key.pem --password secret
     python ksef_faktury_list.py --nip 1234567890 --cert cert.pem --key key.pem --password-file haslo.txt
-    python ksef_faktury_list.py --nip 1234567890 --cert cert.pem --key key.pem  # No password if key is not encrypted
+
+    # Token authentication
+    python ksef_faktury_list.py --nip 1234567890 --token "your-ksef-token"
+    python ksef_faktury_list.py --nip 1234567890 --token-file token.txt
 
 Options:
     --nip           NIP of the entity (required)
-    --cert          Path to certificate file (PEM format)
-    --key           Path to private key file (PEM format)
+    --cert          Path to certificate file (PEM format) - for XAdES auth
+    --key           Path to private key file (PEM format) - for XAdES auth
     --password      Password for encrypted private key
     --password-file File containing password for private key
+    --token         KSeF authorization token - for token auth
+    --token-file    File containing KSeF token
     --env           Environment: test, demo, prod (default: prod)
     --date-from     Start date YYYY-MM-DD (default: 30 days ago)
     --date-to       End date YYYY-MM-DD (default: today)
@@ -67,6 +75,7 @@ from lxml import etree
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, ec
+from cryptography.hazmat.primitives.asymmetric.padding import OAEP, MGF1
 from cryptography.hazmat.backends import default_backend
 
 from reportlab.lib import colors
@@ -129,14 +138,15 @@ class KSeFError(Exception):
 
 class KSeFClient:
     """
-    Standalone KSeF API client with XAdES authentication.
+    Standalone KSeF API client with XAdES or token authentication.
     """
 
     def __init__(
         self,
-        cert_path: str,
-        key_path: str,
+        cert_path: str = None,
+        key_path: str = None,
         key_password: str = None,
+        token: str = None,
         environment: str = 'test',
         timeout: int = 30
     ):
@@ -144,9 +154,10 @@ class KSeFClient:
         Initialize KSeF client.
 
         Args:
-            cert_path: Path to X.509 certificate (PEM format)
-            key_path: Path to private key (PEM format)
+            cert_path: Path to X.509 certificate (PEM format) - for XAdES auth
+            key_path: Path to private key (PEM format) - for XAdES auth
             key_password: Password for encrypted private key
+            token: KSeF authorization token - for token auth
             environment: API environment ('test', 'demo', 'prod')
             timeout: Request timeout in seconds
         """
@@ -159,6 +170,7 @@ class KSeFClient:
         self.cert_path = cert_path
         self.key_path = key_path
         self._key_password = key_password
+        self._ksef_token = token
 
         # Session tokens
         self.authentication_token = None
@@ -169,6 +181,41 @@ class KSeFClient:
         # Loaded certificate and key (lazy loading)
         self._certificate = None
         self._private_key = None
+        self._public_key_pem = None
+
+    @classmethod
+    def from_token(cls, token: str, environment: str = 'test', timeout: int = 30):
+        """
+        Create KSeF client for token-based authentication.
+
+        Args:
+            token: KSeF authorization token
+            environment: API environment ('test', 'demo', 'prod')
+            timeout: Request timeout in seconds
+
+        Returns:
+            KSeFClient instance configured for token auth
+        """
+        return cls(token=token, environment=environment, timeout=timeout)
+
+    @classmethod
+    def from_certificate(cls, cert_path: str, key_path: str, key_password: str = None,
+                         environment: str = 'test', timeout: int = 30):
+        """
+        Create KSeF client for certificate-based (XAdES) authentication.
+
+        Args:
+            cert_path: Path to X.509 certificate (PEM format)
+            key_path: Path to private key (PEM format)
+            key_password: Password for encrypted private key
+            environment: API environment ('test', 'demo', 'prod')
+            timeout: Request timeout in seconds
+
+        Returns:
+            KSeFClient instance configured for XAdES auth
+        """
+        return cls(cert_path=cert_path, key_path=key_path, key_password=key_password,
+                   environment=environment, timeout=timeout)
 
     def _load_certificate(self) -> x509.Certificate:
         """Load X.509 certificate."""
@@ -508,6 +555,197 @@ class KSeFClient:
             data=data,
             with_session=False
         )
+
+    def get_public_key(self) -> str:
+        """
+        Get public key certificate for token encryption from KSeF.
+
+        Returns:
+            PEM-encoded public key
+        """
+        if self._public_key_pem:
+            return self._public_key_pem
+
+        response = self._make_request(
+            'GET',
+            '/security/public-key-certificates',
+            with_session=False
+        )
+
+        # Response can be list or dict with 'certificates' key
+        if isinstance(response, list):
+            certificates = response
+        else:
+            certificates = response.get('certificates', [])
+
+        if not certificates:
+            raise KSeFError("No public key certificates available from KSeF")
+
+        # Find active certificate
+        cert_pem = None
+        for cert in certificates:
+            status = cert.get('status', '')
+            if status.lower() == 'active' or not status:
+                cert_pem = cert.get('certificate') or cert.get('publicKey')
+                if cert_pem:
+                    break
+
+        if not cert_pem:
+            # Fallback to first certificate
+            cert_pem = certificates[0].get('certificate') or certificates[0].get('publicKey')
+
+        if not cert_pem:
+            raise KSeFError("Could not extract public key from KSeF response", response_data=response)
+
+        # Ensure proper PEM format
+        if not cert_pem.startswith('-----'):
+            cert_pem = f"-----BEGIN CERTIFICATE-----\n{cert_pem}\n-----END CERTIFICATE-----"
+
+        self._public_key_pem = cert_pem
+        return cert_pem
+
+    def _encrypt_token_for_ksef(self, token: str, timestamp_ms: int) -> str:
+        """
+        Encrypt token with KSeF public key using RSA-OAEP.
+
+        Args:
+            token: KSeF authorization token
+            timestamp_ms: Timestamp in milliseconds (from challenge)
+
+        Returns:
+            Base64-encoded encrypted token
+        """
+        # Format: token|timestamp
+        token_with_timestamp = f"{token}|{timestamp_ms}"
+
+        # Get public key
+        public_key_pem = self.get_public_key()
+
+        # Load public key (can be certificate or raw public key)
+        try:
+            # Try loading as certificate first
+            if '-----BEGIN CERTIFICATE-----' in public_key_pem:
+                cert = x509.load_pem_x509_certificate(public_key_pem.encode(), default_backend())
+                public_key = cert.public_key()
+            else:
+                # Try as raw public key
+                public_key = serialization.load_pem_public_key(public_key_pem.encode(), default_backend())
+        except Exception as e:
+            raise KSeFError(f"Failed to load public key: {e}")
+
+        # Encrypt using RSA-OAEP with SHA-256
+        encrypted = public_key.encrypt(
+            token_with_timestamp.encode('utf-8'),
+            OAEP(
+                mgf=MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None
+            )
+        )
+
+        return base64.b64encode(encrypted).decode('utf-8')
+
+    def init_session_token(self, nip: str) -> dict:
+        """
+        Initialize KSeF session using authorization token.
+
+        Flow:
+        1. Get challenge from /auth/challenge
+        2. Encrypt token with public key (RSA-OAEP)
+        3. Send to /auth/token
+        4. Check authorization status
+        5. Exchange for accessToken
+
+        Args:
+            nip: Entity NIP
+
+        Returns:
+            dict with access_token, refresh_token and reference_number
+        """
+        if not self._ksef_token:
+            raise KSeFError("No KSeF token configured. Use from_token() or provide token parameter.")
+
+        # Step 1: Get challenge
+        logger.info(f"Getting challenge for NIP: {nip}")
+        challenge_response = self.get_authorisation_challenge(nip)
+        challenge = challenge_response.get('challenge')
+        timestamp_ms = challenge_response.get('timestampMs')
+
+        if not challenge or timestamp_ms is None:
+            raise KSeFError(
+                message="No challenge or timestamp received from KSeF",
+                response_data=challenge_response
+            )
+
+        logger.info(f"Received challenge: {challenge[:20]}..., timestamp: {timestamp_ms}")
+
+        # Step 2: Encrypt token
+        logger.info("Encrypting token with KSeF public key...")
+        encrypted_token = self._encrypt_token_for_ksef(self._ksef_token, timestamp_ms)
+
+        # Step 3: Send encrypted token to /auth/ksef-token
+        logger.info("Sending encrypted token to /auth/ksef-token...")
+        data = {
+            "challenge": challenge,
+            "contextIdentifier": {
+                "type": "Nip",
+                "value": nip
+            },
+            "encryptedToken": encrypted_token
+        }
+
+        response = self._make_request(
+            'POST',
+            '/auth/ksef-token',
+            data=data,
+            with_session=False
+        )
+
+        self.authentication_token = response.get('authenticationToken', {}).get('token')
+        self.reference_number = response.get('referenceNumber')
+
+        if not self.authentication_token:
+            raise KSeFError(
+                message="No authenticationToken received from KSeF",
+                response_data=response
+            )
+
+        logger.info(f"Received authenticationToken, referenceNumber: {self.reference_number}")
+
+        # Step 4: Check authorization status (polling)
+        logger.info("Checking authorization status...")
+        max_attempts = 30
+        for attempt in range(max_attempts):
+            status_response = self.check_auth_status()
+
+            status_obj = status_response.get('status', {})
+            processing_code = status_obj.get('code') or status_response.get('processingCode')
+
+            if processing_code == 200:
+                logger.info("Authorization completed successfully")
+                break
+            elif processing_code == 100:
+                logger.info(f"Authorization in progress (attempt {attempt + 1}/{max_attempts})...")
+                time.sleep(1)
+            else:
+                description = status_obj.get('description', 'Unknown error')
+                details = status_obj.get('details', [])
+                raise KSeFError(
+                    message=f"Authorization error: code {processing_code} - {description}. {' '.join(details or [])}",
+                    response_data=status_response
+                )
+        else:
+            raise KSeFError(message="Authorization timeout")
+
+        # Step 5: Exchange for accessToken
+        logger.info("Exchanging authenticationToken for accessToken...")
+        self.redeem_access_token()
+
+        return {
+            'access_token': self.access_token,
+            'refresh_token': self.refresh_token,
+            'reference_number': self.reference_number,
+        }
 
     def init_session_xades(self, nip: str) -> dict:
         """
@@ -1152,18 +1390,33 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+    # Certificate authentication (XAdES)
     %(prog)s --nip 1234567890 --cert cert.pem --key key.pem --password secret
     %(prog)s --nip 1234567890 --cert cert.pem --key key.pem --password-file pass.txt
-    %(prog)s --nip 1234567890 --cert cert.pem --key key.pem --env prod --date-from 2025-01-01
-    %(prog)s --nip 1234567890 --cert cert.pem --key key.pem --subject-type Subject1 --output json
+
+    # Token authentication
+    %(prog)s --nip 1234567890 --token "your-ksef-token"
+    %(prog)s --nip 1234567890 --token-file token.txt
+
+    # With options
+    %(prog)s --nip 1234567890 --token-file token.txt --env prod --date-from 2025-01-01
+    %(prog)s --nip 1234567890 --token-file token.txt --download-pdf --pdf-output-dir ./pdf
         """
     )
 
     parser.add_argument('--nip', required=True, help='NIP of the entity')
-    parser.add_argument('--cert', required=True, help='Path to certificate file (PEM)')
-    parser.add_argument('--key', required=True, help='Path to private key file (PEM)')
-    parser.add_argument('--password', help='Password for encrypted private key')
-    parser.add_argument('--password-file', help='File containing password for private key')
+
+    # Certificate auth options
+    auth_cert = parser.add_argument_group('Certificate authentication (XAdES)')
+    auth_cert.add_argument('--cert', help='Path to certificate file (PEM)')
+    auth_cert.add_argument('--key', help='Path to private key file (PEM)')
+    auth_cert.add_argument('--password', help='Password for encrypted private key')
+    auth_cert.add_argument('--password-file', help='File containing password for private key')
+
+    # Token auth options
+    auth_token = parser.add_argument_group('Token authentication')
+    auth_token.add_argument('--token', help='KSeF authorization token')
+    auth_token.add_argument('--token-file', help='File containing KSeF token')
     parser.add_argument('--env', choices=['test', 'demo', 'prod'], default='prod',
                         help='KSeF environment (default: prod)')
     parser.add_argument('--date-from', help='Start date YYYY-MM-DD (default: 30 days ago)')
@@ -1192,22 +1445,50 @@ Examples:
         format='%(asctime)s - %(levelname)s - %(message)s'
     )
 
-    # Get password
-    password = args.password
-    if not password and args.password_file:
-        if not os.path.exists(args.password_file):
-            print(f"Error: Password file not found: {args.password_file}", file=sys.stderr)
-            sys.exit(1)
-        with open(args.password_file, 'r') as f:
-            password = f.read().strip()
+    # Determine authentication method
+    use_token_auth = args.token or args.token_file
+    use_cert_auth = args.cert or args.key
 
-    # Validate files
-    if not os.path.exists(args.cert):
-        print(f"Error: Certificate file not found: {args.cert}", file=sys.stderr)
+    if not use_token_auth and not use_cert_auth:
+        print("Error: Must provide either token (--token/--token-file) or certificate (--cert/--key)", file=sys.stderr)
         sys.exit(1)
-    if not os.path.exists(args.key):
-        print(f"Error: Private key file not found: {args.key}", file=sys.stderr)
+
+    if use_token_auth and use_cert_auth:
+        print("Error: Cannot use both token and certificate authentication. Choose one method.", file=sys.stderr)
         sys.exit(1)
+
+    # Get token
+    token = None
+    if use_token_auth:
+        token = args.token
+        if not token and args.token_file:
+            if not os.path.exists(args.token_file):
+                print(f"Error: Token file not found: {args.token_file}", file=sys.stderr)
+                sys.exit(1)
+            with open(args.token_file, 'r') as f:
+                token = f.read().strip()
+        if not token:
+            print("Error: Token is empty", file=sys.stderr)
+            sys.exit(1)
+
+    # Get password for certificate
+    password = None
+    if use_cert_auth:
+        password = args.password
+        if not password and args.password_file:
+            if not os.path.exists(args.password_file):
+                print(f"Error: Password file not found: {args.password_file}", file=sys.stderr)
+                sys.exit(1)
+            with open(args.password_file, 'r') as f:
+                password = f.read().strip()
+
+        # Validate certificate files
+        if not args.cert or not os.path.exists(args.cert):
+            print(f"Error: Certificate file not found: {args.cert}", file=sys.stderr)
+            sys.exit(1)
+        if not args.key or not os.path.exists(args.key):
+            print(f"Error: Private key file not found: {args.key}", file=sys.stderr)
+            sys.exit(1)
 
     # Parse dates
     date_from = None
@@ -1226,19 +1507,31 @@ Examples:
             sys.exit(1)
 
     try:
-        # Create client
-        client = KSeFClient(
-            cert_path=args.cert,
-            key_path=args.key,
-            key_password=password,
-            environment=args.env
-        )
+        # Create client based on authentication method
+        if use_token_auth:
+            client = KSeFClient.from_token(
+                token=token,
+                environment=args.env
+            )
+            auth_method = "token"
+        else:
+            client = KSeFClient.from_certificate(
+                cert_path=args.cert,
+                key_path=args.key,
+                key_password=password,
+                environment=args.env
+            )
+            auth_method = "certificate (XAdES)"
 
         print(f"Connecting to KSeF ({args.env} environment)...")
         print(f"NIP: {args.nip}")
+        print(f"Auth method: {auth_method}")
 
         # Initialize session
-        session_info = client.init_session_xades(args.nip)
+        if use_token_auth:
+            session_info = client.init_session_token(args.nip)
+        else:
+            session_info = client.init_session_xades(args.nip)
         print(f"Session initialized. Reference: {session_info['reference_number']}")
 
         # Query invoices

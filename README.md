@@ -5,7 +5,9 @@ Samodzielny skrypt Python do pobierania faktur z KSeF (Krajowy System e-Faktur).
 ## Opis
 
 Skrypt umożliwia:
-- Autoryzację w systemie KSeF przy użyciu certyfikatu kwalifikowanego (XAdES-BES)
+- Autoryzację w systemie KSeF przy użyciu:
+  - Certyfikatu kwalifikowanego (XAdES-BES)
+  - Tokenu autoryzacyjnego KSeF
 - Pobieranie listy faktur zakupowych (otrzymanych) lub sprzedażowych (wystawionych)
 - Eksport wyników w formacie tabeli lub JSON
 - Pobieranie pełnych plików XML faktur
@@ -14,8 +16,9 @@ Skrypt umożliwia:
 ## Wymagania
 
 - Python 3.8+
-- Certyfikat kwalifikowany zarejestrowany w KSeF (plik `.crt` lub `.pem`)
-- Klucz prywatny do certyfikatu (plik `.key` lub `.pem`)
+- Jedna z metod autoryzacji:
+  - **Certyfikat**: Certyfikat kwalifikowany zarejestrowany w KSeF (plik `.pem`) + klucz prywatny
+  - **Token**: Token autoryzacyjny wygenerowany w portalu KSeF
 
 ## Instalacja
 
@@ -124,16 +127,28 @@ docker run --rm \
   --password "$KSEF_PASSWORD"
 ```
 
+**Autoryzacja tokenem w Docker:**
+```bash
+docker run --rm \
+  -v /ścieżka/do/tokenu:/certs:ro \
+  -v /ścieżka/do/wyników:/output \
+  ksef-faktury \
+  --nip 1234567890 \
+  --token-file /certs/token.txt \
+  --download-pdf \
+  --pdf-output-dir /output
+```
+
 ### Wolumeny
 
 | Ścieżka w kontenerze | Opis |
 |----------------------|------|
-| `/certs` | Katalog na certyfikat i klucz prywatny (montuj jako read-only `:ro`) |
+| `/certs` | Katalog na certyfikat, klucz prywatny lub token (montuj jako read-only `:ro`) |
 | `/output` | Katalog na pobrane pliki XML i PDF faktur |
 
 ### Docker Compose
 
-Przykładowy `docker-compose.yml`:
+Przykładowy `docker-compose.yml` (certyfikat):
 
 ```yaml
 services:
@@ -159,6 +174,25 @@ services:
       - /output
 ```
 
+Przykładowy `docker-compose.yml` (token):
+
+```yaml
+services:
+  ksef:
+    build: .
+    volumes:
+      - ./certs:/certs:ro
+      - ./output:/output
+    command:
+      - --nip
+      - "1234567890"
+      - --token-file
+      - /certs/token.txt
+      - --download-pdf
+      - --pdf-output-dir
+      - /output
+```
+
 Uruchomienie:
 ```bash
 docker compose run --rm ksef
@@ -168,8 +202,14 @@ docker compose run --rm ksef
 
 ### Podstawowe użycie
 
+**Autoryzacja certyfikatem (XAdES):**
 ```bash
-python ksef_faktury_list.py --nip 1234567890 --cert certyfikat.crt --key klucz.key --password haslo
+python ksef_faktury_list.py --nip 1234567890 --cert certyfikat.pem --key klucz.pem --password haslo
+```
+
+**Autoryzacja tokenem:**
+```bash
+python ksef_faktury_list.py --nip 1234567890 --token-file token.txt
 ```
 
 ### Opcje
@@ -177,10 +217,15 @@ python ksef_faktury_list.py --nip 1234567890 --cert certyfikat.crt --key klucz.k
 | Opcja | Opis |
 |-------|------|
 | `--nip` | NIP podmiotu (wymagane) |
+| **Autoryzacja certyfikatem** | |
 | `--cert` | Ścieżka do pliku certyfikatu (PEM) |
 | `--key` | Ścieżka do pliku klucza prywatnego (PEM) |
 | `--password` | Hasło do klucza prywatnego |
 | `--password-file` | Plik zawierający hasło do klucza |
+| **Autoryzacja tokenem** | |
+| `--token` | Token autoryzacyjny KSeF |
+| `--token-file` | Plik zawierający token KSeF |
+| **Pozostałe opcje** | |
 | `--env` | Środowisko: `test`, `demo`, `prod` (domyślnie: `prod`) |
 | `--date-from` | Data początkowa YYYY-MM-DD (domyślnie: 30 dni wstecz) |
 | `--date-to` | Data końcowa YYYY-MM-DD (domyślnie: dziś) |
@@ -230,6 +275,17 @@ python ksef_faktury_list.py --nip 1234567890 --cert cert.pem --key key.pem --pas
     --download-pdf --pdf-output-dir ./pdf
 ```
 
+**Pobierz faktury używając tokenu:**
+```bash
+python ksef_faktury_list.py --nip 1234567890 --token-file token.txt
+```
+
+**Token z plikami PDF:**
+```bash
+python ksef_faktury_list.py --nip 1234567890 --token-file token.txt \
+    --download-pdf --pdf-output-dir ./faktury_pdf
+```
+
 **Użycie hasła z pliku (bezpieczniejsze):**
 ```bash
 echo "moje_haslo" > haslo.txt
@@ -241,6 +297,42 @@ python ksef_faktury_list.py --nip 1234567890 --cert cert.pem --key key.pem --pas
 ```bash
 python ksef_faktury_list.py --nip 1234567890 --cert cert.pem --key key.pem --password haslo --env test
 ```
+
+## Metody autoryzacji
+
+### Autoryzacja certyfikatem (XAdES-BES)
+
+Wymaga certyfikatu kwalifikowanego zarejestrowanego w portalu KSeF. Certyfikat musi być w formacie PEM.
+
+```bash
+python ksef_faktury_list.py --nip 1234567890 --cert cert.pem --key key.pem --password haslo
+```
+
+### Autoryzacja tokenem
+
+Token autoryzacyjny można wygenerować w portalu KSeF ([ksef.mf.gov.pl](https://ksef.mf.gov.pl)) w sekcji "Tokeny". Token jest szyfrowany kluczem publicznym KSeF (RSA-OAEP z SHA-256).
+
+**Generowanie tokenu w portalu KSeF:**
+1. Zaloguj się do portalu KSeF
+2. Przejdź do sekcji "Tokeny" → "Generuj token"
+3. Nadaj nazwę tokenowi i wybierz uprawnienia (np. odczyt faktur)
+4. Skopiuj wygenerowany token (wyświetlany tylko raz!)
+5. Zapisz token do pliku: `echo "twoj-token" > token.txt`
+
+**Użycie tokenu:**
+```bash
+# Token bezpośrednio w linii poleceń
+python ksef_faktury_list.py --nip 1234567890 --token "twoj-token-ksef"
+
+# Token z pliku (zalecane)
+python ksef_faktury_list.py --nip 1234567890 --token-file token.txt
+```
+
+**Zalety autoryzacji tokenem:**
+- Nie wymaga certyfikatu kwalifikowanego
+- Można ograniczyć uprawnienia tokenu (np. tylko odczyt)
+- Token można w każdej chwili unieważnić w portalu KSeF
+- Prostsze wdrożenie w środowiskach automatyzacji
 
 ## Środowiska KSeF
 
