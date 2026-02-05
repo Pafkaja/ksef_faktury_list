@@ -1,0 +1,13 @@
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+*.pem
+*.key
+*.crt
+README.md
+.env
+.venv
+venv
+*.log

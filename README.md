@@ -35,6 +35,97 @@ lxml>=4.9.0
 cryptography>=38.0.0
 ```
 
+## Docker
+
+### Budowanie obrazu
+
+```bash
+docker build -t ksef-faktury .
+```
+
+### Uruchomienie
+
+**Wyświetl pomoc:**
+```bash
+docker run --rm ksef-faktury
+```
+
+**Pobierz faktury zakupowe:**
+```bash
+docker run --rm \
+  -v /ścieżka/do/certyfikatów:/certs:ro \
+  -v /ścieżka/do/wyników:/output \
+  ksef-faktury \
+  --nip 1234567890 \
+  --cert /certs/cert.pem \
+  --key /certs/key.pem \
+  --password "haslo" \
+  --env prod
+```
+
+**Pobierz faktury wraz z plikami XML:**
+```bash
+docker run --rm \
+  -v /ścieżka/do/certyfikatów:/certs:ro \
+  -v /ścieżka/do/wyników:/output \
+  ksef-faktury \
+  --nip 1234567890 \
+  --cert /certs/cert.pem \
+  --key /certs/key.pem \
+  --password-file /certs/haslo.txt \
+  --download-xml \
+  --xml-output-dir /output
+```
+
+**Użycie zmiennej środowiskowej dla hasła:**
+```bash
+docker run --rm \
+  -v /ścieżka/do/certyfikatów:/certs:ro \
+  -e KSEF_PASSWORD="haslo" \
+  ksef-faktury \
+  --nip 1234567890 \
+  --cert /certs/cert.pem \
+  --key /certs/key.pem \
+  --password "$KSEF_PASSWORD"
+```
+
+### Wolumeny
+
+| Ścieżka w kontenerze | Opis |
+|----------------------|------|
+| `/certs` | Katalog na certyfikat i klucz prywatny (montuj jako read-only `:ro`) |
+| `/output` | Katalog na pobrane pliki XML faktur |
+
+### Docker Compose
+
+Przykładowy `docker-compose.yml`:
+
+```yaml
+services:
+  ksef:
+    build: .
+    volumes:
+      - ./certs:/certs:ro
+      - ./output:/output
+    command:
+      - --nip
+      - "1234567890"
+      - --cert
+      - /certs/cert.pem
+      - --key
+      - /certs/key.pem
+      - --password-file
+      - /certs/haslo.txt
+      - --download-xml
+      - --xml-output-dir
+      - /output
+```
+
+Uruchomienie:
+```bash
+docker compose run --rm ksef
+```
+
 ## Użycie
 
 ### Podstawowe użycie
