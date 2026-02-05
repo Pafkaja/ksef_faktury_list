@@ -9,6 +9,7 @@ Skrypt umożliwia:
 - Pobieranie listy faktur zakupowych (otrzymanych) lub sprzedażowych (wystawionych)
 - Eksport wyników w formacie tabeli lub JSON
 - Pobieranie pełnych plików XML faktur
+- Generowanie faktur w formacie PDF z pełną obsługą polskich znaków
 
 ## Wymagania
 
@@ -33,7 +34,27 @@ pip install -r requirements.txt
 requests>=2.28.0
 lxml>=4.9.0
 cryptography>=38.0.0
+reportlab>=4.0.0
 ```
+
+### Fonty (dla generowania PDF)
+
+Do poprawnego wyświetlania polskich znaków w PDF wymagany jest font **DejaVu Sans**.
+
+**Linux (Debian/Ubuntu):**
+```bash
+sudo apt-get install fonts-dejavu-core
+```
+
+**Linux (Fedora/RHEL):**
+```bash
+sudo dnf install dejavu-sans-fonts
+```
+
+**Windows:**
+Font DejaVu Sans można pobrać z [dejavu-fonts.github.io](https://dejavu-fonts.github.io/) i zainstalować w systemie.
+
+Jeśli font nie zostanie znaleziony, PDF będzie generowany z domyślnym fontem Helvetica (bez polskich znaków).
 
 ## Docker
 
@@ -77,6 +98,20 @@ docker run --rm \
   --xml-output-dir /output
 ```
 
+**Generuj faktury jako PDF:**
+```bash
+docker run --rm \
+  -v /ścieżka/do/certyfikatów:/certs:ro \
+  -v /ścieżka/do/wyników:/output \
+  ksef-faktury \
+  --nip 1234567890 \
+  --cert /certs/cert.pem \
+  --key /certs/key.pem \
+  --password-file /certs/haslo.txt \
+  --download-pdf \
+  --pdf-output-dir /output
+```
+
 **Użycie zmiennej środowiskowej dla hasła:**
 ```bash
 docker run --rm \
@@ -94,7 +129,7 @@ docker run --rm \
 | Ścieżka w kontenerze | Opis |
 |----------------------|------|
 | `/certs` | Katalog na certyfikat i klucz prywatny (montuj jako read-only `:ro`) |
-| `/output` | Katalog na pobrane pliki XML faktur |
+| `/output` | Katalog na pobrane pliki XML i PDF faktur |
 
 ### Docker Compose
 
@@ -118,6 +153,9 @@ services:
       - /certs/haslo.txt
       - --download-xml
       - --xml-output-dir
+      - /output
+      - --download-pdf
+      - --pdf-output-dir
       - /output
 ```
 
@@ -150,6 +188,8 @@ python ksef_faktury_list.py --nip 1234567890 --cert certyfikat.crt --key klucz.k
 | `--output` | Format wyjścia: `table`, `json` (domyślnie: `table`) |
 | `--download-xml` | Pobierz pełne pliki XML faktur |
 | `--xml-output-dir` | Katalog do zapisu plików XML (domyślnie: bieżący) |
+| `--download-pdf` | Generuj pliki PDF dla każdej faktury |
+| `--pdf-output-dir` | Katalog do zapisu plików PDF (domyślnie: bieżący) |
 | `--verbose`, `-v` | Włącz szczegółowe logowanie |
 
 ### Przykłady
@@ -177,6 +217,19 @@ python ksef_faktury_list.py --nip 1234567890 --cert cert.pem --key key.pem --pas
     --download-xml --xml-output-dir ./faktury_xml
 ```
 
+**Generuj faktury jako PDF:**
+```bash
+python ksef_faktury_list.py --nip 1234567890 --cert cert.pem --key key.pem --password haslo \
+    --download-pdf --pdf-output-dir ./faktury_pdf
+```
+
+**Pobierz XML i wygeneruj PDF jednocześnie:**
+```bash
+python ksef_faktury_list.py --nip 1234567890 --cert cert.pem --key key.pem --password haslo \
+    --download-xml --xml-output-dir ./xml \
+    --download-pdf --pdf-output-dir ./pdf
+```
+
 **Użycie hasła z pliku (bezpieczniejsze):**
 ```bash
 echo "moje_haslo" > haslo.txt
@@ -196,6 +249,28 @@ python ksef_faktury_list.py --nip 1234567890 --cert cert.pem --key key.pem --pas
 | `test` | api-test.ksef.mf.gov.pl | Środowisko testowe |
 | `demo` | api-demo.ksef.mf.gov.pl | Środowisko demonstracyjne |
 | `prod` | api.ksef.mf.gov.pl | Środowisko produkcyjne |
+
+## Generowanie PDF
+
+Opcja `--download-pdf` generuje pliki PDF z faktur pobranych z KSeF. Każdy PDF zawiera:
+
+- **Nagłówek** - numer faktury VAT, data wystawienia, okres rozliczeniowy (jeśli dotyczy)
+- **Dane sprzedawcy** - nazwa, NIP, adres
+- **Dane nabywcy** - nazwa, NIP, adres
+- **Tabela pozycji** - lp., nazwa towaru/usługi, jednostka miary, ilość, cena netto, wartość netto, stawka VAT
+- **Podsumowanie** - wartość netto, VAT, kwota brutto do zapłaty
+- **Stopka** - informacje dodatkowe, dane rejestrowe (KRS, REGON)
+
+### Obsługiwane waluty
+
+PDF obsługuje faktury w różnych walutach (PLN, EUR, USD itp.). Dla faktur w walutach obcych wyświetlana jest również przeliczona wartość VAT w PLN (jeśli dostępna w XML).
+
+### Nazwa pliku
+
+Pliki PDF są zapisywane z nazwą odpowiadającą numerowi KSeF faktury, np.:
+```
+1234567890-20250115-ABC123DEF456-01.pdf
+```
 
 ## Przykładowy wynik
 
@@ -223,6 +298,8 @@ Session terminated.
 - Maksymalny zakres dat to 90 dni (ograniczenie API KSeF)
 - Maksymalna liczba wyników na stronę to 250
 - Certyfikat musi być zarejestrowany w KSeF i mieć przypisane uprawnienia do podmiotu (NIP)
+- Generowanie PDF wymaga pobrania pełnego XML faktury z KSeF (dodatkowe zapytania API)
+- PDF jest generowany na podstawie schematu FA (3) - głównego formatu faktur KSeF
 
 ## Rozwiązywanie problemów
 
@@ -241,6 +318,19 @@ Session terminated.
 
 - Sprawdź połączenie internetowe
 - Sprawdź czy adresy API KSeF nie są blokowane przez firewall
+
+### Brak polskich znaków w PDF
+
+- Zainstaluj font DejaVu Sans (patrz sekcja "Fonty")
+- W Dockerze font jest instalowany automatycznie
+- Sprawdź czy font jest dostępny w jednej z lokalizacji:
+  - `/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf` (Debian/Ubuntu)
+  - `/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf` (Fedora/RHEL)
+
+### Błąd generowania PDF
+
+- Upewnij się, że masz zainstalowany pakiet `reportlab`: `pip install reportlab`
+- Sprawdź czy katalog wyjściowy istnieje i masz uprawnienia do zapisu
 
 ## Licencja
 

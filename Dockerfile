@@ -3,13 +3,14 @@ FROM python:3.12-slim
 LABEL maintainer="KSeF Invoice Reader"
 LABEL description="Docker container for fetching invoices from KSeF (Krajowy System e-Faktur)"
 
-# Install system dependencies required for lxml and cryptography
+# Install system dependencies required for lxml, cryptography and PDF fonts
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libxml2-dev \
     libxslt1-dev \
     libffi-dev \
     libssl-dev \
     gcc \
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

@@ -46,6 +46,7 @@ Options:
     --subject-type  Subject1 (issued/sales) or Subject2 (received/purchases), default: Subject2
     --output        Output format: table, json, xml (default: table)
     --download-xml  Download full XML for each invoice
+    --download-pdf  Generate PDF for each invoice
     --verbose       Enable verbose logging
 """
 
@@ -67,6 +68,45 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, ec
 from cryptography.hazmat.backends import default_backend
+
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
+# Register DejaVu Sans font for Polish characters support
+_FONT_REGISTERED = False
+_FONT_NAME = 'Helvetica'  # fallback
+
+def _register_polish_font():
+    """Register font with Polish characters support."""
+    global _FONT_REGISTERED, _FONT_NAME
+    if _FONT_REGISTERED:
+        return
+
+    # Common paths for DejaVu fonts
+    font_paths = [
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+        '/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf',
+        '/usr/share/fonts/dejavu/DejaVuSans.ttf',
+        '/usr/share/fonts/TTF/DejaVuSans.ttf',
+        'C:/Windows/Fonts/DejaVuSans.ttf',
+    ]
+
+    for font_path in font_paths:
+        if os.path.exists(font_path):
+            try:
+                pdfmetrics.registerFont(TTFont('DejaVuSans', font_path))
+                _FONT_NAME = 'DejaVuSans'
+                logger.info(f"Registered font: {font_path}")
+                break
+            except Exception as e:
+                logger.warning(f"Failed to register font {font_path}: {e}")
+
+    _FONT_REGISTERED = True
 
 # KSeF API URLs
 KSEF_URLS = {
@@ -695,6 +735,375 @@ class KSeFClient:
         return response.text
 
 
+class InvoicePDFGenerator:
+    """Generate PDF from KSeF invoice XML."""
+
+    # KSeF XML namespaces
+    NAMESPACES = {
+        'fa': 'http://crd.gov.pl/wzor/2025/06/25/13775/',
+        'etd': 'http://crd.gov.pl/xml/schematy/dziedzinowe/mf/2022/01/05/eD/DefinicjeTypy/',
+    }
+
+    def __init__(self):
+        _register_polish_font()
+        self.font_name = _FONT_NAME
+        self.styles = getSampleStyleSheet()
+        self._setup_styles()
+
+    def _setup_styles(self):
+        """Setup custom paragraph styles with Polish font."""
+        # Update base styles to use Polish font
+        for style_name in ['Normal', 'Heading1', 'Heading2', 'Heading3', 'BodyText']:
+            if style_name in self.styles:
+                self.styles[style_name].fontName = self.font_name
+
+        self.styles.add(ParagraphStyle(
+            name='InvoiceTitle',
+            fontName=self.font_name,
+            fontSize=16,
+            leading=20,
+            alignment=1,  # center
+            spaceAfter=10,
+        ))
+        self.styles.add(ParagraphStyle(
+            name='SectionHeader',
+            fontName=self.font_name,
+            fontSize=11,
+            leading=14,
+            spaceBefore=10,
+            spaceAfter=5,
+            textColor=colors.HexColor('#333333'),
+        ))
+        self.styles.add(ParagraphStyle(
+            name='CompanyName',
+            fontName=self.font_name,
+            fontSize=10,
+            leading=12,
+        ))
+        self.styles.add(ParagraphStyle(
+            name='CompanyDetails',
+            fontName=self.font_name,
+            fontSize=9,
+            leading=11,
+            textColor=colors.HexColor('#555555'),
+        ))
+        self.styles.add(ParagraphStyle(
+            name='Footer',
+            fontName=self.font_name,
+            fontSize=8,
+            leading=10,
+            textColor=colors.HexColor('#666666'),
+        ))
+
+    def _get_text(self, element, xpath: str, default: str = '') -> str:
+        """Extract text from XML element using xpath."""
+        # Try with namespace prefix
+        for prefix, ns in self.NAMESPACES.items():
+            try:
+                result = element.find(xpath.replace('//', f'//{prefix}:').replace('/', f'/{prefix}:'),
+                                      {prefix: ns})
+                if result is not None and result.text:
+                    return result.text.strip()
+            except Exception:
+                pass
+
+        # Try without namespace (some XMLs don't use prefixes)
+        try:
+            # Remove namespace from element for search
+            for elem in element.iter():
+                if '}' in elem.tag:
+                    elem.tag = elem.tag.split('}')[1]
+            result = element.find(xpath.lstrip('/'))
+            if result is not None and result.text:
+                return result.text.strip()
+        except Exception:
+            pass
+
+        return default
+
+    def _parse_xml(self, xml_content: str) -> dict:
+        """Parse KSeF XML invoice into dictionary."""
+        # Remove namespace prefixes for easier parsing
+        xml_clean = xml_content
+        root = etree.fromstring(xml_clean.encode('utf-8'))
+
+        # Strip namespaces from tags for easier access
+        for elem in root.iter():
+            if '}' in elem.tag:
+                elem.tag = elem.tag.split('}')[1]
+
+        data = {
+            'invoice_number': '',
+            'invoice_date': '',
+            'currency': 'PLN',
+            'seller': {},
+            'buyer': {},
+            'items': [],
+            'summary': {},
+            'payment': {},
+            'footer': [],
+        }
+
+        # Invoice number and date
+        fa = root.find('.//Fa')
+        if fa is not None:
+            data['invoice_number'] = fa.findtext('P_2', '')
+            data['invoice_date'] = fa.findtext('P_1', '')
+            data['currency'] = fa.findtext('KodWaluty', 'PLN')
+
+            # Period
+            okres = fa.find('OkresFa')
+            if okres is not None:
+                data['period_from'] = okres.findtext('P_6_Od', '')
+                data['period_to'] = okres.findtext('P_6_Do', '')
+
+            # Summary totals
+            data['summary'] = {
+                'net_23': self._parse_amount(fa.findtext('P_13_1', '0')),
+                'vat_23': self._parse_amount(fa.findtext('P_14_1', '0')),
+                'vat_23_converted': self._parse_amount(fa.findtext('P_14_1W', '')),
+                'gross': self._parse_amount(fa.findtext('P_15', '0')),
+            }
+
+            # Items
+            for wiersz in fa.findall('FaWiersz'):
+                item = {
+                    'lp': wiersz.findtext('NrWierszaFa', ''),
+                    'name': wiersz.findtext('P_7', ''),
+                    'unit': wiersz.findtext('P_8A', ''),
+                    'qty': self._parse_amount(wiersz.findtext('P_8B', '1')),
+                    'unit_price': self._parse_amount(wiersz.findtext('P_9A', '0')),
+                    'net_value': self._parse_amount(wiersz.findtext('P_11', '0')),
+                    'vat_rate': wiersz.findtext('P_12', ''),
+                    'gross_value': self._parse_amount(wiersz.findtext('P_11A', '')),
+                    'vat_value': self._parse_amount(wiersz.findtext('P_11Vat', '')),
+                }
+                data['items'].append(item)
+
+            # Payment info
+            platnosc = fa.find('Platnosc')
+            if platnosc is not None:
+                data['payment']['description'] = platnosc.findtext('OpisPlatnosci', '')
+                data['payment']['due_date'] = platnosc.findtext('TerminPlatnosci', '')
+
+        # Seller (Podmiot1)
+        podmiot1 = root.find('.//Podmiot1')
+        if podmiot1 is not None:
+            dane = podmiot1.find('DaneIdentyfikacyjne')
+            adres = podmiot1.find('Adres')
+            data['seller'] = {
+                'nip': dane.findtext('NIP', '') if dane is not None else '',
+                'name': dane.findtext('Nazwa', '') if dane is not None else '',
+                'address1': adres.findtext('AdresL1', '') if adres is not None else '',
+                'address2': adres.findtext('AdresL2', '') if adres is not None else '',
+                'country': adres.findtext('KodKraju', 'PL') if adres is not None else 'PL',
+            }
+
+        # Buyer (Podmiot2)
+        podmiot2 = root.find('.//Podmiot2')
+        if podmiot2 is not None:
+            dane = podmiot2.find('DaneIdentyfikacyjne')
+            adres = podmiot2.find('Adres')
+            data['buyer'] = {
+                'nip': dane.findtext('NIP', '') if dane is not None else '',
+                'name': dane.findtext('Nazwa', '') if dane is not None else '',
+                'address1': adres.findtext('AdresL1', '') if adres is not None else '',
+                'address2': adres.findtext('AdresL2', '') if adres is not None else '',
+                'country': adres.findtext('KodKraju', 'PL') if adres is not None else 'PL',
+            }
+
+        # Footer
+        stopka = root.find('.//Stopka')
+        if stopka is not None:
+            for info in stopka.findall('.//StopkaFaktury'):
+                if info.text:
+                    data['footer'].append(info.text.strip())
+            rejestry = stopka.find('Rejestry')
+            if rejestry is not None:
+                krs = rejestry.findtext('KRS', '')
+                regon = rejestry.findtext('REGON', '')
+                if krs:
+                    data['footer'].append(f'KRS: {krs}')
+                if regon:
+                    data['footer'].append(f'REGON: {regon}')
+
+        return data
+
+    def _parse_amount(self, value: str) -> float:
+        """Parse amount string to float."""
+        if not value:
+            return 0.0
+        try:
+            return float(value.replace(',', '.').replace(' ', ''))
+        except ValueError:
+            return 0.0
+
+    def _format_amount(self, amount: float, currency: str = 'PLN') -> str:
+        """Format amount for display."""
+        return f"{amount:,.2f} {currency}".replace(',', ' ').replace('.', ',').replace(' ', ' ')
+
+    def generate_pdf(self, xml_content: str, output_path: str) -> str:
+        """
+        Generate PDF from KSeF XML invoice.
+
+        Args:
+            xml_content: Invoice XML content
+            output_path: Path to save PDF file
+
+        Returns:
+            Path to generated PDF
+        """
+        data = self._parse_xml(xml_content)
+        currency = data.get('currency', 'PLN')
+
+        doc = SimpleDocTemplate(
+            output_path,
+            pagesize=A4,
+            rightMargin=15*mm,
+            leftMargin=15*mm,
+            topMargin=15*mm,
+            bottomMargin=15*mm
+        )
+
+        elements = []
+
+        # Title
+        title = Paragraph(f"FAKTURA VAT nr {data['invoice_number']}", self.styles['InvoiceTitle'])
+        elements.append(title)
+
+        # Invoice date and period
+        date_text = f"Data wystawienia: {data['invoice_date']}"
+        if data.get('period_from') and data.get('period_to'):
+            date_text += f"<br/>Okres rozliczeniowy: {data['period_from']} - {data['period_to']}"
+        elements.append(Paragraph(date_text, self.styles['Normal']))
+        elements.append(Spacer(1, 10*mm))
+
+        # Seller and Buyer side by side
+        seller = data.get('seller', {})
+        buyer = data.get('buyer', {})
+
+        parties_data = [
+            [
+                Paragraph("<b>SPRZEDAWCA</b>", self.styles['SectionHeader']),
+                Paragraph("<b>NABYWCA</b>", self.styles['SectionHeader'])
+            ],
+            [
+                Paragraph(f"<b>{seller.get('name', '')}</b>", self.styles['CompanyName']),
+                Paragraph(f"<b>{buyer.get('name', '')}</b>", self.styles['CompanyName'])
+            ],
+            [
+                Paragraph(f"NIP: {seller.get('nip', '')}", self.styles['CompanyDetails']),
+                Paragraph(f"NIP: {buyer.get('nip', '')}", self.styles['CompanyDetails'])
+            ],
+            [
+                Paragraph(seller.get('address1', ''), self.styles['CompanyDetails']),
+                Paragraph(buyer.get('address1', ''), self.styles['CompanyDetails'])
+            ],
+            [
+                Paragraph(seller.get('address2', ''), self.styles['CompanyDetails']),
+                Paragraph(buyer.get('address2', ''), self.styles['CompanyDetails'])
+            ],
+        ]
+
+        parties_table = Table(parties_data, colWidths=[90*mm, 90*mm])
+        parties_table.setStyle(TableStyle([
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('LEFTPADDING', (0, 0), (-1, -1), 0),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 5),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+        ]))
+        elements.append(parties_table)
+        elements.append(Spacer(1, 8*mm))
+
+        # Items table
+        elements.append(Paragraph("<b>POZYCJE FAKTURY</b>", self.styles['SectionHeader']))
+
+        # Table header
+        items_header = ['Lp.', 'Nazwa towaru/usługi', 'J.m.', 'Ilość', 'Cena netto', 'Wartość netto', 'VAT %']
+        items_data = [items_header]
+
+        for item in data.get('items', []):
+            row = [
+                item['lp'],
+                Paragraph(item['name'], self.styles['Normal']),
+                item['unit'],
+                f"{item['qty']:.2f}".replace('.', ','),
+                self._format_amount(item['unit_price'], ''),
+                self._format_amount(item['net_value'], ''),
+                f"{item['vat_rate']}%",
+            ]
+            items_data.append(row)
+
+        col_widths = [10*mm, 70*mm, 15*mm, 15*mm, 25*mm, 25*mm, 15*mm]
+        items_table = Table(items_data, colWidths=col_widths)
+        items_table.setStyle(TableStyle([
+            # Header
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#4472C4')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTNAME', (0, 0), (-1, -1), self.font_name),
+            ('FONTSIZE', (0, 0), (-1, 0), 9),
+            ('FONTSIZE', (0, 1), (-1, -1), 8),
+            ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
+            ('ALIGN', (0, 1), (0, -1), 'CENTER'),  # Lp
+            ('ALIGN', (2, 1), (2, -1), 'CENTER'),  # J.m.
+            ('ALIGN', (3, 1), (-1, -1), 'RIGHT'),  # Numbers
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#CCCCCC')),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F2F2F2')]),
+            ('TOPPADDING', (0, 0), (-1, -1), 4),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+        ]))
+        elements.append(items_table)
+        elements.append(Spacer(1, 8*mm))
+
+        # Summary
+        elements.append(Paragraph("<b>PODSUMOWANIE</b>", self.styles['SectionHeader']))
+
+        summary = data.get('summary', {})
+        summary_data = [
+            ['Wartość netto (23%):', self._format_amount(summary.get('net_23', 0), currency)],
+            ['VAT (23%):', self._format_amount(summary.get('vat_23', 0), currency)],
+            ['', ''],
+            ['<b>RAZEM DO ZAPŁATY:</b>', f"<b>{self._format_amount(summary.get('gross', 0), currency)}</b>"],
+        ]
+
+        # Add converted VAT if present (for foreign currency)
+        if summary.get('vat_23_converted'):
+            summary_data.insert(2, ['VAT (23%) w PLN:', self._format_amount(summary.get('vat_23_converted', 0), 'PLN')])
+
+        summary_table_data = [[Paragraph(str(row[0]), self.styles['Normal']),
+                               Paragraph(str(row[1]), self.styles['Normal'])] for row in summary_data]
+
+        summary_table = Table(summary_table_data, colWidths=[120*mm, 55*mm])
+        summary_table.setStyle(TableStyle([
+            ('ALIGN', (0, 0), (0, -1), 'RIGHT'),
+            ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+            ('TOPPADDING', (0, 0), (-1, -1), 3),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+        ]))
+        elements.append(summary_table)
+
+        # Footer
+        if data.get('footer'):
+            elements.append(Spacer(1, 10*mm))
+            elements.append(Paragraph("<b>Informacje dodatkowe:</b>", self.styles['Footer']))
+            for line in data['footer']:
+                # Truncate very long lines
+                if len(line) > 200:
+                    line = line[:200] + '...'
+                elements.append(Paragraph(line, self.styles['Footer']))
+
+        # KSeF note
+        elements.append(Spacer(1, 5*mm))
+        elements.append(Paragraph(
+            "Faktura wygenerowana z Krajowego Systemu e-Faktur (KSeF)",
+            self.styles['Footer']
+        ))
+
+        doc.build(elements)
+        return output_path
+
+
 def format_amount(amount) -> str:
     """Format amount for display."""
     if amount is None:
@@ -767,6 +1176,10 @@ Examples:
                         help='Download full XML for each invoice')
     parser.add_argument('--xml-output-dir', default='.',
                         help='Directory to save XML files (default: current directory)')
+    parser.add_argument('--download-pdf', action='store_true',
+                        help='Generate PDF for each invoice')
+    parser.add_argument('--pdf-output-dir', default='.',
+                        help='Directory to save PDF files (default: current directory)')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Enable verbose logging')
 
@@ -865,6 +1278,27 @@ Examples:
                         print(f"  Downloaded: {filepath}")
                     except KSeFError as e:
                         print(f"  Error downloading {ksef_number}: {e.message}", file=sys.stderr)
+
+        # Generate PDF if requested
+        if args.download_pdf and invoices:
+            print(f"\nGenerating PDF files to: {args.pdf_output_dir}")
+            os.makedirs(args.pdf_output_dir, exist_ok=True)
+            pdf_generator = InvoicePDFGenerator()
+
+            for inv in invoices:
+                ksef_number = inv.get('ksefNumber')
+                if ksef_number:
+                    try:
+                        xml_content = client.get_invoice_xml(ksef_number)
+                        # Sanitize filename
+                        safe_name = ksef_number.replace('/', '_').replace('\\', '_')
+                        filepath = os.path.join(args.pdf_output_dir, f"{safe_name}.pdf")
+                        pdf_generator.generate_pdf(xml_content, filepath)
+                        print(f"  Generated: {filepath}")
+                    except KSeFError as e:
+                        print(f"  Error generating PDF for {ksef_number}: {e.message}", file=sys.stderr)
+                    except Exception as e:
+                        print(f"  Error generating PDF for {ksef_number}: {e}", file=sys.stderr)
 
         # Terminate session
         print("\nTerminating session...")
