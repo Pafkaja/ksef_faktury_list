@@ -12,6 +12,7 @@ Skrypt umożliwia:
 - Eksport wyników w formacie tabeli lub JSON
 - Pobieranie pełnych plików XML faktur
 - Generowanie faktur w formacie PDF z pełną obsługą polskich znaków
+- Wysyłanie faktur e-mailem (PDF + XML jako załączniki) przez SMTP
 
 ## Wymagania
 
@@ -149,6 +150,21 @@ docker run --rm \
   --pdf-output-dir /output
 ```
 
+**Pobierz faktury i wyślij e-mailem:**
+```bash
+docker run --rm \
+  -v /ścieżka/do/certyfikatów:/certs:ro \
+  ksef-faktury \
+  --nip 1234567890 \
+  --cert /certs/cert.pem \
+  --key /certs/key.pem \
+  --password-file /certs/haslo.txt \
+  --smtp-host smtp.gmail.com \
+  --smtp-user user@gmail.com \
+  --smtp-password "haslo-aplikacji" \
+  --email-to odbiorca@example.com
+```
+
 ### Wolumeny
 
 | Ścieżka w kontenerze | Opis |
@@ -248,6 +264,17 @@ python ksef_faktury_list.py --nip 1234567890 --token-file token.txt
 | `--download-pdf` | Generuj pliki PDF dla każdej faktury |
 | `--pdf-output-dir` | Katalog do zapisu plików PDF (domyślnie: bieżący) |
 | `--verbose`, `-v` | Włącz szczegółowe logowanie |
+| **Wysyłanie e-mail** | |
+| `--send-email` | Włącz wysyłanie faktur e-mailem (włączane automatycznie gdy podano `--smtp-host`) |
+| `--smtp-host` | Adres serwera SMTP |
+| `--smtp-port` | Port SMTP (domyślnie: `587`) |
+| `--smtp-user` | Użytkownik SMTP |
+| `--smtp-password` | Hasło SMTP |
+| `--smtp-password-file` | Plik zawierający hasło SMTP |
+| `--email-from` | Adres nadawcy (domyślnie: wartość `--smtp-user`) |
+| `--email-to` | Adres odbiorcy (można podać wielokrotnie) |
+| `--email-subject` | Szablon tematu e-maila (domyślnie: `"Faktura KSeF: {invoice_number}"`) |
+| `--email-group` | Grupowanie: `single` (osobny mail per faktura, domyślnie) lub `all` (wszystkie w jednym mailu) |
 
 ### Przykłady
 
@@ -320,6 +347,72 @@ python ksef_faktury_list.py --xml-to-pdf faktura.xml
 python ksef_faktury_list.py --xml-to-pdf ./faktury_xml/ --pdf-output-dir ./faktury_pdf/
 ```
 
+### Wysyłanie faktur e-mailem
+
+**Wyślij faktury na e-mail (osobny mail per faktura):**
+```bash
+python ksef_faktury_list.py --nip 1234567890 --cert cert.pem --key key.pem --password haslo \
+    --smtp-host smtp.gmail.com \
+    --smtp-user user@gmail.com \
+    --smtp-password "haslo-aplikacji" \
+    --email-to odbiorca@example.com
+```
+
+**Wyślij na wiele adresów:**
+```bash
+python ksef_faktury_list.py --nip 1234567890 --token-file token.txt \
+    --smtp-host smtp.gmail.com \
+    --smtp-user user@gmail.com \
+    --smtp-password "haslo-aplikacji" \
+    --email-to odbiorca1@example.com \
+    --email-to odbiorca2@example.com
+```
+
+**Wszystkie faktury w jednym mailu:**
+```bash
+python ksef_faktury_list.py --nip 1234567890 --token-file token.txt \
+    --smtp-host smtp.gmail.com \
+    --smtp-user user@gmail.com \
+    --smtp-password "haslo-aplikacji" \
+    --email-to odbiorca@example.com \
+    --email-group all
+```
+
+**Niestandardowy adres nadawcy i temat:**
+```bash
+python ksef_faktury_list.py --nip 1234567890 --token-file token.txt \
+    --smtp-host smtp.firma.pl \
+    --smtp-user ksef@firma.pl \
+    --smtp-password-file smtp_haslo.txt \
+    --email-from "Księgowość <ksiegowosc@firma.pl>" \
+    --email-to kontrahent@example.com \
+    --email-subject "Faktura nr {invoice_number} - Firma Sp. z o.o."
+```
+
+**Hasło SMTP z pliku (bezpieczniejsze):**
+```bash
+echo -n "haslo-smtp" > smtp_haslo.txt
+chmod 600 smtp_haslo.txt
+python ksef_faktury_list.py --nip 1234567890 --token-file token.txt \
+    --smtp-host smtp.gmail.com \
+    --smtp-user user@gmail.com \
+    --smtp-password-file smtp_haslo.txt \
+    --email-to odbiorca@example.com
+```
+
+**Pobierz PDF + XML i wyślij mailem jednocześnie:**
+```bash
+python ksef_faktury_list.py --nip 1234567890 --token-file token.txt \
+    --download-xml --xml-output-dir ./xml \
+    --download-pdf --pdf-output-dir ./pdf \
+    --smtp-host smtp.gmail.com \
+    --smtp-user user@gmail.com \
+    --smtp-password "haslo-aplikacji" \
+    --email-to odbiorca@example.com
+```
+
+> **Uwaga:** Gdy używasz jednocześnie `--download-xml`, `--download-pdf` i wysyłki e-mail, skrypt pobiera XML z KSeF tylko raz (cache) — nie ma duplikowania zapytań API.
+
 ## Metody autoryzacji
 
 ### Autoryzacja certyfikatem (XAdES-BES)
@@ -389,23 +482,66 @@ Pliki PDF są zapisywane z nazwą odpowiadającą numerowi KSeF faktury, np.:
 ## Przykładowy wynik
 
 ```
-Connecting to KSeF (prod environment)...
+Łączenie z KSeF (środowisko: prod)...
 NIP: 1234567890
-Session initialized. Reference: 20250205-SE-ABC123DEF456
+Metoda autoryzacji: certyfikat (XAdES)
+Sesja zainicjalizowana. Numer referencyjny: 20250205-SE-ABC123DEF456
 
-Querying Subject2 invoices...
+Pobieranie faktur otrzymane (zakupy)...
 
 ========================================================================================================================
-KSeF Number                                   Invoice #            Date         Seller NIP   Gross Amount
+Numer KSeF                                    Nr faktury           Data         NIP sprzed.  Kwota brutto
 ========================================================================================================================
 1234567890-20250115-ABC123DEF456-01          FV/2025/001          2025-01-15   9876543210         1,230.00
 1234567890-20250120-ABC123DEF456-02          FV/2025/002          2025-01-20   9876543210         2,460.00
 ========================================================================================================================
-Total: 2 invoice(s)
+Razem: 2 faktur(a/y)
 
-Terminating session...
-Session terminated.
+Kończenie sesji...
+Sesja zakończona.
 ```
+
+## Wysyłanie e-mail
+
+### Opis
+
+Opcje `--smtp-*` i `--email-*` umożliwiają wysyłanie pobranych faktur e-mailem. Każda faktura jest wysyłana z dwoma załącznikami:
+- **PDF** — wizualna reprezentacja faktury
+- **XML** — oryginalna faktura KSeF
+
+Wysyłka jest włączana automatycznie po podaniu `--smtp-host`. Adres nadawcy (`--email-from`) domyślnie przyjmuje wartość `--smtp-user`.
+
+### Tryby grupowania
+
+| Tryb | Opis |
+|------|------|
+| `single` (domyślnie) | Osobny e-mail dla każdej faktury |
+| `all` | Wszystkie faktury w jednym e-mailu ze wszystkimi załącznikami |
+
+### Szablon tematu
+
+Opcja `--email-subject` przyjmuje szablon z placeholderem `{invoice_number}`:
+- W trybie `single`: zastępowany numerem faktury, np. `FV/2025/001`
+- W trybie `all`: zastępowany liczbą faktur, np. `3 faktur`
+
+### Konfiguracja Gmail
+
+Gmail wymaga użycia **Hasła do aplikacji** (App Password) zamiast zwykłego hasła:
+
+1. Włącz weryfikację dwuetapową na koncie Google
+2. Wygeneruj hasło aplikacji: [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)
+3. Użyj wygenerowanego 16-znakowego hasła jako `--smtp-password`
+
+| Parametr | Wartość dla Gmail |
+|----------|-------------------|
+| `--smtp-host` | `smtp.gmail.com` |
+| `--smtp-port` | `587` (domyślnie) |
+| `--smtp-user` | twój adres Gmail |
+| `--smtp-password` | 16-znakowe hasło aplikacji |
+
+### Cache XML/PDF
+
+Gdy używasz jednocześnie `--download-xml`, `--download-pdf` i wysyłki e-mail, skrypt wykorzystuje wewnętrzny cache — XML każdej faktury jest pobierany z KSeF tylko raz, niezależnie od liczby operacji które go wymagają.
 
 ## Uwagi
 
