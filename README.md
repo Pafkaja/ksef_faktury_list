@@ -139,6 +139,16 @@ docker run --rm \
   --pdf-output-dir /output
 ```
 
+**Konwersja XML na PDF offline (bez autoryzacji):**
+```bash
+docker run --rm \
+  -v /ścieżka/do/xml:/input:ro \
+  -v /ścieżka/do/wyników:/output \
+  ksef-faktury \
+  --xml-to-pdf /input \
+  --pdf-output-dir /output
+```
+
 ### Wolumeny
 
 | Ścieżka w kontenerze | Opis |
@@ -216,7 +226,9 @@ python ksef_faktury_list.py --nip 1234567890 --token-file token.txt
 
 | Opcja | Opis |
 |-------|------|
-| `--nip` | NIP podmiotu (wymagane) |
+| `--nip` | NIP podmiotu (wymagane dla zapytań do KSeF) |
+| **Konwersja offline** | |
+| `--xml-to-pdf` | Konwertuj plik XML lub katalog plików XML na PDF (bez autoryzacji KSeF) |
 | **Autoryzacja certyfikatem** | |
 | `--cert` | Ścieżka do pliku certyfikatu (PEM) |
 | `--key` | Ścieżka do pliku klucza prywatnego (PEM) |
@@ -296,6 +308,16 @@ python ksef_faktury_list.py --nip 1234567890 --cert cert.pem --key key.pem --pas
 **Użycie środowiska testowego:**
 ```bash
 python ksef_faktury_list.py --nip 1234567890 --cert cert.pem --key key.pem --password haslo --env test
+```
+
+**Konwersja istniejącego pliku XML na PDF (offline, bez autoryzacji):**
+```bash
+python ksef_faktury_list.py --xml-to-pdf faktura.xml
+```
+
+**Konwersja całego katalogu plików XML na PDF:**
+```bash
+python ksef_faktury_list.py --xml-to-pdf ./faktury_xml/ --pdf-output-dir ./faktury_pdf/
 ```
 
 ## Metody autoryzacji

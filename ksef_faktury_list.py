@@ -1079,6 +1079,8 @@ class InvoicePDFGenerator:
             'items': [],
             'summary': {},
             'payment': {},
+            'additional_descriptions': [],
+            'pricing_type': 'net',
             'footer': [],
         }
 
@@ -1095,11 +1097,28 @@ class InvoicePDFGenerator:
                 data['period_from'] = okres.findtext('P_6_Od', '')
                 data['period_to'] = okres.findtext('P_6_Do', '')
 
-            # Summary totals
+            # Summary totals - collect all VAT rates
+            vat_rate_fields = [
+                ('P_13_1', 'P_14_1', 'P_14_1W', '23%'),
+                ('P_13_2', 'P_14_2', 'P_14_2W', '22%'),
+                ('P_13_3', 'P_14_3', 'P_14_3W', '8%'),
+                ('P_13_4', 'P_14_4', 'P_14_4W', '7%'),
+                ('P_13_5', 'P_14_5', 'P_14_5W', '5%'),
+                ('P_13_6_1', None, None, '0%'),
+                ('P_13_6_2', None, None, '0% (WDT)'),
+                ('P_13_6_3', None, None, '0% (eksport)'),
+                ('P_13_7', None, None, 'zw'),
+                ('P_13_8', None, None, 'np'),
+            ]
+            rates = []
+            for net_field, vat_field, vat_conv_field, label in vat_rate_fields:
+                net = self._parse_amount(fa.findtext(net_field, ''))
+                vat = self._parse_amount(fa.findtext(vat_field, '')) if vat_field else 0.0
+                vat_conv = self._parse_amount(fa.findtext(vat_conv_field, '')) if vat_conv_field else 0.0
+                if net:
+                    rates.append({'label': label, 'net': net, 'vat': vat, 'vat_converted': vat_conv})
             data['summary'] = {
-                'net_23': self._parse_amount(fa.findtext('P_13_1', '0')),
-                'vat_23': self._parse_amount(fa.findtext('P_14_1', '0')),
-                'vat_23_converted': self._parse_amount(fa.findtext('P_14_1W', '')),
+                'rates': rates,
                 'gross': self._parse_amount(fa.findtext('P_15', '0')),
             }
 
@@ -1110,19 +1129,44 @@ class InvoicePDFGenerator:
                     'name': wiersz.findtext('P_7', ''),
                     'unit': wiersz.findtext('P_8A', ''),
                     'qty': self._parse_amount(wiersz.findtext('P_8B', '1')),
-                    'unit_price': self._parse_amount(wiersz.findtext('P_9A', '0')),
-                    'net_value': self._parse_amount(wiersz.findtext('P_11', '0')),
-                    'vat_rate': wiersz.findtext('P_12', ''),
+                    'unit_price_net': self._parse_amount(wiersz.findtext('P_9A', '')),
+                    'unit_price_gross': self._parse_amount(wiersz.findtext('P_9B', '')),
+                    'net_value': self._parse_amount(wiersz.findtext('P_11', '')),
                     'gross_value': self._parse_amount(wiersz.findtext('P_11A', '')),
+                    'vat_rate': wiersz.findtext('P_12', ''),
                     'vat_value': self._parse_amount(wiersz.findtext('P_11Vat', '')),
                 }
                 data['items'].append(item)
+
+            # Determine pricing type (net vs gross)
+            has_net_prices = any(item['unit_price_net'] for item in data['items'])
+            data['pricing_type'] = 'net' if has_net_prices else 'gross'
+
+            # Additional descriptions (DodatkowyOpis)
+            for opis in fa.findall('DodatkowyOpis'):
+                klucz = opis.findtext('Klucz', '')
+                wartosc = opis.findtext('Wartosc', '')
+                if klucz or wartosc:
+                    data['additional_descriptions'].append({'key': klucz, 'value': wartosc})
 
             # Payment info
             platnosc = fa.find('Platnosc')
             if platnosc is not None:
                 data['payment']['description'] = platnosc.findtext('OpisPlatnosci', '')
-                data['payment']['due_date'] = platnosc.findtext('TerminPlatnosci', '')
+                data['payment']['form'] = platnosc.findtext('FormaPlatnosci', '')
+                # Due dates (can be multiple TerminPlatnosci entries)
+                terminy = platnosc.findall('TerminPlatnosci')
+                due_dates = []
+                for termin in terminy:
+                    date = termin.findtext('Termin', '') or (termin.text.strip() if termin.text else '')
+                    if date:
+                        due_dates.append(date)
+                data['payment']['due_dates'] = due_dates
+                # Bank account
+                rachunek = platnosc.find('RachunekBankowy')
+                if rachunek is not None:
+                    data['payment']['bank_account'] = rachunek.findtext('NrRB', '')
+                    data['payment']['bank_name'] = rachunek.findtext('NazwaBanku', '')
 
         # Seller (Podmiot1)
         podmiot1 = root.find('.//Podmiot1')
@@ -1256,19 +1300,40 @@ class InvoicePDFGenerator:
         # Items table
         elements.append(Paragraph("<b>POZYCJE FAKTURY</b>", self.styles['SectionHeader']))
 
-        # Table header
-        items_header = ['Lp.', 'Nazwa towaru/usługi', 'J.m.', 'Ilość', 'Cena netto', 'Wartość netto', 'VAT %']
+        # Table header - adjust labels based on pricing type
+        pricing_type = data.get('pricing_type', 'net')
+        if pricing_type == 'net':
+            price_label = 'Cena netto'
+            value_label = 'Wartość netto'
+        else:
+            price_label = 'Cena brutto'
+            value_label = 'Wartość brutto'
+
+        items_header = ['Lp.', 'Nazwa towaru/usługi', 'J.m.', 'Ilość', price_label, value_label, 'VAT']
         items_data = [items_header]
 
         for item in data.get('items', []):
+            if pricing_type == 'net':
+                unit_price = item.get('unit_price_net') or item.get('unit_price_gross', 0)
+                value = item.get('net_value') or item.get('gross_value', 0)
+            else:
+                unit_price = item.get('unit_price_gross') or item.get('unit_price_net', 0)
+                value = item.get('gross_value') or item.get('net_value', 0)
+
+            vat_rate = item.get('vat_rate', '')
+            if vat_rate and vat_rate not in ('zw', 'np', 'oo'):
+                vat_display = f"{vat_rate}%"
+            else:
+                vat_display = vat_rate
+
             row = [
                 item['lp'],
                 Paragraph(item['name'], self.styles['Normal']),
                 item['unit'],
                 f"{item['qty']:.2f}".replace('.', ','),
-                self._format_amount(item['unit_price'], ''),
-                self._format_amount(item['net_value'], ''),
-                f"{item['vat_rate']}%",
+                self._format_amount(unit_price, ''),
+                self._format_amount(value, ''),
+                vat_display,
             ]
             items_data.append(row)
 
@@ -1298,16 +1363,29 @@ class InvoicePDFGenerator:
         elements.append(Paragraph("<b>PODSUMOWANIE</b>", self.styles['SectionHeader']))
 
         summary = data.get('summary', {})
-        summary_data = [
-            ['Wartość netto (23%):', self._format_amount(summary.get('net_23', 0), currency)],
-            ['VAT (23%):', self._format_amount(summary.get('vat_23', 0), currency)],
-            ['', ''],
-            ['<b>RAZEM DO ZAPŁATY:</b>', f"<b>{self._format_amount(summary.get('gross', 0), currency)}</b>"],
-        ]
+        summary_data = []
 
-        # Add converted VAT if present (for foreign currency)
-        if summary.get('vat_23_converted'):
-            summary_data.insert(2, ['VAT (23%) w PLN:', self._format_amount(summary.get('vat_23_converted', 0), 'PLN')])
+        for rate in summary.get('rates', []):
+            summary_data.append([
+                f"Wartość netto ({rate['label']}):",
+                self._format_amount(rate['net'], currency)
+            ])
+            if rate.get('vat'):
+                summary_data.append([
+                    f"VAT ({rate['label']}):",
+                    self._format_amount(rate['vat'], currency)
+                ])
+            if rate.get('vat_converted'):
+                summary_data.append([
+                    f"VAT ({rate['label']}) w PLN:",
+                    self._format_amount(rate['vat_converted'], 'PLN')
+                ])
+
+        summary_data.append(['', ''])
+        summary_data.append([
+            '<b>RAZEM DO ZAPŁATY:</b>',
+            f"<b>{self._format_amount(summary.get('gross', 0), currency)}</b>"
+        ])
 
         summary_table_data = [[Paragraph(str(row[0]), self.styles['Normal']),
                                Paragraph(str(row[1]), self.styles['Normal'])] for row in summary_data]
@@ -1321,14 +1399,48 @@ class InvoicePDFGenerator:
         ]))
         elements.append(summary_table)
 
+        # Payment info
+        payment = data.get('payment', {})
+        if any(payment.values()):
+            elements.append(Spacer(1, 5*mm))
+            elements.append(Paragraph("<b>PŁATNOŚĆ</b>", self.styles['SectionHeader']))
+
+            payment_form_names = {
+                '1': 'gotówka', '2': 'karta', '3': 'bon', '4': 'czek',
+                '5': 'kredyt', '6': 'przelew', '7': 'mobilna',
+            }
+            if payment.get('form'):
+                form_display = payment_form_names.get(payment['form'], payment['form'])
+                elements.append(Paragraph(f"Forma płatności: {form_display}", self.styles['Normal']))
+            if payment.get('due_dates'):
+                for date in payment['due_dates']:
+                    elements.append(Paragraph(f"Termin płatności: {date}", self.styles['Normal']))
+            if payment.get('bank_account'):
+                line = f"Nr rachunku: {payment['bank_account']}"
+                if payment.get('bank_name'):
+                    line += f" ({payment['bank_name']})"
+                elements.append(Paragraph(line, self.styles['Normal']))
+            if payment.get('description'):
+                elements.append(Paragraph(f"{payment['description']}", self.styles['Normal']))
+
+        # Additional descriptions (DodatkowyOpis)
+        additional_descs = data.get('additional_descriptions', [])
+        if additional_descs:
+            elements.append(Spacer(1, 5*mm))
+            elements.append(Paragraph("<b>INFORMACJE DODATKOWE</b>", self.styles['SectionHeader']))
+            for desc in additional_descs:
+                key = desc.get('key', '')
+                value = desc.get('value', '')
+                if key and value:
+                    elements.append(Paragraph(f"<b>{key}:</b> {value}", self.styles['Normal']))
+                elif value:
+                    elements.append(Paragraph(value, self.styles['Normal']))
+
         # Footer
         if data.get('footer'):
             elements.append(Spacer(1, 10*mm))
             elements.append(Paragraph("<b>Informacje dodatkowe:</b>", self.styles['Footer']))
             for line in data['footer']:
-                # Truncate very long lines
-                if len(line) > 200:
-                    line = line[:200] + '...'
                 elements.append(Paragraph(line, self.styles['Footer']))
 
         # KSeF note
@@ -1401,10 +1513,19 @@ Examples:
     # With options
     %(prog)s --nip 1234567890 --token-file token.txt --env prod --date-from 2025-01-01
     %(prog)s --nip 1234567890 --token-file token.txt --download-pdf --pdf-output-dir ./pdf
+
+    # Offline XML to PDF conversion (no authentication needed)
+    %(prog)s --xml-to-pdf faktura.xml
+    %(prog)s --xml-to-pdf ./faktury_xml/ --pdf-output-dir ./faktury_pdf/
         """
     )
 
-    parser.add_argument('--nip', required=True, help='NIP of the entity')
+    parser.add_argument('--nip', help='NIP of the entity (required for KSeF queries)')
+
+    # Offline XML to PDF conversion
+    offline_group = parser.add_argument_group('Offline XML to PDF conversion (no authentication needed)')
+    offline_group.add_argument('--xml-to-pdf', metavar='PATH',
+                               help='Convert XML file or directory of XML files to PDF (offline, no KSeF auth)')
 
     # Certificate auth options
     auth_cert = parser.add_argument_group('Certificate authentication (XAdES)')
@@ -1445,9 +1566,57 @@ Examples:
         format='%(asctime)s - %(levelname)s - %(message)s'
     )
 
+    # Offline XML to PDF conversion (no authentication needed)
+    if args.xml_to_pdf:
+        xml_path = args.xml_to_pdf
+        pdf_output_dir = args.pdf_output_dir
+
+        if not os.path.exists(xml_path):
+            print(f"Error: Path not found: {xml_path}", file=sys.stderr)
+            sys.exit(1)
+
+        # Collect XML files
+        if os.path.isfile(xml_path):
+            xml_files = [xml_path]
+        else:
+            xml_files = sorted(
+                f.path for f in os.scandir(xml_path)
+                if f.is_file() and f.name.lower().endswith('.xml')
+            )
+            if not xml_files:
+                print(f"Error: No XML files found in: {xml_path}", file=sys.stderr)
+                sys.exit(1)
+
+        os.makedirs(pdf_output_dir, exist_ok=True)
+        pdf_generator = InvoicePDFGenerator()
+
+        print(f"Converting {len(xml_files)} XML file(s) to PDF...")
+        ok_count = 0
+        err_count = 0
+        for xml_file in xml_files:
+            try:
+                with open(xml_file, 'r', encoding='utf-8') as f:
+                    xml_content = f.read()
+
+                base_name = os.path.splitext(os.path.basename(xml_file))[0]
+                pdf_path = os.path.join(pdf_output_dir, f"{base_name}.pdf")
+                pdf_generator.generate_pdf(xml_content, pdf_path)
+                print(f"  OK: {xml_file} -> {pdf_path}")
+                ok_count += 1
+            except Exception as e:
+                print(f"  Error: {xml_file}: {e}", file=sys.stderr)
+                err_count += 1
+
+        print(f"\nDone. Converted: {ok_count}, errors: {err_count}")
+        sys.exit(0 if err_count == 0 else 1)
+
     # Determine authentication method
     use_token_auth = args.token or args.token_file
     use_cert_auth = args.cert or args.key
+
+    if not args.nip:
+        print("Error: --nip is required for KSeF queries", file=sys.stderr)
+        sys.exit(1)
 
     if not use_token_auth and not use_cert_auth:
         print("Error: Must provide either token (--token/--token-file) or certificate (--cert/--key)", file=sys.stderr)
