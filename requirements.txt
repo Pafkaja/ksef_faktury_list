@@ -2,3 +2,4 @@ requests>=2.28.0
 lxml>=4.9.0
 cryptography>=38.0.0
 reportlab>=4.0.0
+qrcode[pil]>=7.4.0

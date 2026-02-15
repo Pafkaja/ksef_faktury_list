@@ -62,6 +62,7 @@ import argparse
 import base64
 import datetime
 import hashlib
+import io
 import json
 import logging
 import os
@@ -87,9 +88,11 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+
+import qrcode
 
 # Register DejaVu Sans font for Polish characters support
 _FONT_REGISTERED = False
@@ -127,6 +130,13 @@ KSEF_URLS = {
     'test': 'https://api-test.ksef.mf.gov.pl/v2',
     'demo': 'https://api-demo.ksef.mf.gov.pl/v2',
     'prod': 'https://api.ksef.mf.gov.pl/v2',
+}
+
+# KSeF QR verification URLs (per environment)
+KSEF_QR_URLS = {
+    'test': 'https://qr-test.ksef.mf.gov.pl',
+    'demo': 'https://qr-demo.ksef.mf.gov.pl',
+    'prod': 'https://qr.ksef.mf.gov.pl',
 }
 
 logger = logging.getLogger(__name__)
@@ -1229,13 +1239,63 @@ class InvoicePDFGenerator:
         """Format amount for display."""
         return f"{amount:,.2f} {currency}".replace(',', ' ').replace('.', ',').replace(' ', ' ')
 
-    def generate_pdf(self, xml_content: str, output_path: str) -> str:
+    def _generate_qr_image(self, xml_content: str, seller_nip: str,
+                           invoice_date: str, environment: str = 'prod') -> io.BytesIO:
+        """
+        Generate QR code image for KSeF invoice verification.
+
+        The QR encodes a verification URL per the KSeF specification:
+        {base_url}/invoice/{seller_nip}/{DD-MM-YYYY}/{SHA256_base64url}
+
+        Args:
+            xml_content: Original invoice XML content (used for SHA-256 hash)
+            seller_nip: Seller's NIP number
+            invoice_date: Invoice date in YYYY-MM-DD format (from P_1)
+            environment: KSeF environment ('test', 'demo', 'prod')
+
+        Returns:
+            BytesIO buffer containing QR code PNG image
+        """
+        # SHA-256 hash of XML content, Base64URL encoded
+        xml_bytes = xml_content.encode('utf-8')
+        sha256_hash = hashlib.sha256(xml_bytes).digest()
+        hash_b64url = base64.urlsafe_b64encode(sha256_hash).rstrip(b'=').decode('ascii')
+
+        # Convert date from YYYY-MM-DD to DD-MM-YYYY
+        try:
+            dt = datetime.datetime.strptime(invoice_date, '%Y-%m-%d')
+            date_formatted = dt.strftime('%d-%m-%Y')
+        except (ValueError, TypeError):
+            date_formatted = invoice_date
+
+        base_url = KSEF_QR_URLS.get(environment, KSEF_QR_URLS['prod'])
+        verification_url = f"{base_url}/invoice/{seller_nip}/{date_formatted}/{hash_b64url}"
+
+        qr = qrcode.QRCode(
+            version=None,
+            error_correction=qrcode.constants.ERROR_CORRECT_M,
+            box_size=4,
+            border=2,
+        )
+        qr.add_data(verification_url)
+        qr.make(fit=True)
+
+        img = qr.make_image(fill_color="black", back_color="white")
+        buf = io.BytesIO()
+        img.save(buf, format='PNG')
+        buf.seek(0)
+        return buf
+
+    def generate_pdf(self, xml_content: str, output_path: str,
+                     environment: str = 'prod', ksef_number: str = None) -> str:
         """
         Generate PDF from KSeF XML invoice.
 
         Args:
             xml_content: Invoice XML content
             output_path: Path to save PDF file
+            environment: KSeF environment for QR code URL ('test', 'demo', 'prod')
+            ksef_number: KSeF reference number (displayed below QR code)
 
         Returns:
             Path to generated PDF
@@ -1257,6 +1317,10 @@ class InvoicePDFGenerator:
         # Title
         title = Paragraph(f"FAKTURA VAT nr {data['invoice_number']}", self.styles['InvoiceTitle'])
         elements.append(title)
+
+        # KSeF number (if available)
+        if ksef_number:
+            elements.append(Paragraph(f"Numer KSeF: {ksef_number}", self.styles['Normal']))
 
         # Invoice date and period
         date_text = f"Data wystawienia: {data['invoice_date']}"
@@ -1448,12 +1512,52 @@ class InvoicePDFGenerator:
             for line in data['footer']:
                 elements.append(Paragraph(line, self.styles['Footer']))
 
-        # KSeF note
+        # KSeF QR code and note
         elements.append(Spacer(1, 5*mm))
-        elements.append(Paragraph(
-            "Faktura wygenerowana z Krajowego Systemu e-Faktur (KSeF)",
-            self.styles['Footer']
-        ))
+
+        seller_nip = data.get('seller', {}).get('nip', '')
+        invoice_date = data.get('invoice_date', '')
+        if seller_nip and invoice_date:
+            try:
+                qr_buf = self._generate_qr_image(xml_content, seller_nip, invoice_date, environment)
+                qr_img = Image(qr_buf, width=30*mm, height=30*mm)
+
+                ksef_label = ksef_number if ksef_number else ''
+                qr_table_data = [[
+                    qr_img,
+                    [
+                        Paragraph(
+                            "Faktura wygenerowana z Krajowego Systemu e-Faktur (KSeF)",
+                            self.styles['Footer']
+                        ),
+                        Spacer(1, 2*mm),
+                        Paragraph(
+                            "Kod QR służy do weryfikacji faktury w systemie KSeF",
+                            self.styles['Footer']
+                        ),
+                    ] + ([
+                        Spacer(1, 2*mm),
+                        Paragraph(f"Numer KSeF: {ksef_label}", self.styles['Footer']),
+                    ] if ksef_label else []),
+                ]]
+                qr_table = Table(qr_table_data, colWidths=[35*mm, 140*mm])
+                qr_table.setStyle(TableStyle([
+                    ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                    ('LEFTPADDING', (0, 0), (0, 0), 0),
+                    ('LEFTPADDING', (1, 0), (1, 0), 5*mm),
+                ]))
+                elements.append(qr_table)
+            except Exception as e:
+                logger.warning(f"Nie udało się wygenerować kodu QR: {e}")
+                elements.append(Paragraph(
+                    "Faktura wygenerowana z Krajowego Systemu e-Faktur (KSeF)",
+                    self.styles['Footer']
+                ))
+        else:
+            elements.append(Paragraph(
+                "Faktura wygenerowana z Krajowego Systemu e-Faktur (KSeF)",
+                self.styles['Footer']
+            ))
 
         doc.build(elements)
         return output_path
@@ -1763,7 +1867,8 @@ Examples:
 
                 base_name = os.path.splitext(os.path.basename(xml_file))[0]
                 pdf_path = os.path.join(pdf_output_dir, f"{base_name}.pdf")
-                pdf_generator.generate_pdf(xml_content, pdf_path)
+                pdf_generator.generate_pdf(xml_content, pdf_path,
+                                           environment=args.env, ksef_number=base_name)
                 print(f"  OK: {xml_file} -> {pdf_path}")
                 ok_count += 1
             except Exception as e:
@@ -1928,7 +2033,8 @@ Examples:
                         # Sanitize filename
                         safe_name = ksef_number.replace('/', '_').replace('\\', '_')
                         filepath = os.path.join(args.pdf_output_dir, f"{safe_name}.pdf")
-                        pdf_generator.generate_pdf(xml_content, filepath)
+                        pdf_generator.generate_pdf(xml_content, filepath,
+                                                   environment=args.env, ksef_number=ksef_number)
                         pdf_cache[ksef_number] = filepath
                         print(f"  Wygenerowano: {filepath}")
                     except KSeFError as e:
@@ -1998,7 +2104,8 @@ Examples:
                             try:
                                 tmp = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
                                 tmp.close()
-                                pdf_generator_email.generate_pdf(xml_content, tmp.name)
+                                pdf_generator_email.generate_pdf(xml_content, tmp.name,
+                                                                 environment=args.env, ksef_number=ksef_number)
                                 pdf_path = tmp.name
                                 pdf_cache[ksef_number] = pdf_path
                                 temp_pdfs.append(tmp.name)
@@ -2061,7 +2168,8 @@ Examples:
                             try:
                                 tmp = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
                                 tmp.close()
-                                pdf_generator_email.generate_pdf(xml_content, tmp.name)
+                                pdf_generator_email.generate_pdf(xml_content, tmp.name,
+                                                                 environment=args.env, ksef_number=ksef_number)
                                 pdf_path = tmp.name
                                 pdf_cache[ksef_number] = pdf_path
                                 temp_pdfs.append(tmp.name)
