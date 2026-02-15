@@ -39,6 +39,7 @@ requests>=2.28.0
 lxml>=4.9.0
 cryptography>=38.0.0
 reportlab>=4.0.0
+qrcode[pil]>=7.4.0
 ```
 
 ### Fonty (dla generowania PDF)
@@ -461,12 +462,13 @@ python ksef_faktury_list.py --nip 1234567890 --token-file token.txt
 
 Opcja `--download-pdf` generuje pliki PDF z faktur pobranych z KSeF. Każdy PDF zawiera:
 
-- **Nagłówek** - numer faktury VAT, data wystawienia, okres rozliczeniowy (jeśli dotyczy)
+- **Nagłówek** - numer faktury VAT, numer KSeF, data wystawienia, okres rozliczeniowy (jeśli dotyczy)
 - **Dane sprzedawcy** - nazwa, NIP, adres
 - **Dane nabywcy** - nazwa, NIP, adres
 - **Tabela pozycji** - lp., nazwa towaru/usługi, jednostka miary, ilość, cena netto, wartość netto, stawka VAT
-- **Podsumowanie** - wartość netto, VAT, kwota brutto do zapłaty
+- **Podsumowanie** - wartość netto, VAT, kwota brutto do zapłaty (stawki obliczane z kwot)
 - **Stopka** - informacje dodatkowe, dane rejestrowe (KRS, REGON)
+- **Kod QR** - kod weryfikujący zgodny ze specyfikacją KSeF (SHA-256 + Base64URL), umożliwiający weryfikację faktury na stronie MF
 
 ### Obsługiwane waluty
 
@@ -549,7 +551,8 @@ Gdy używasz jednocześnie `--download-xml`, `--download-pdf` i wysyłki e-mail,
 - Maksymalna liczba wyników na stronę to 250
 - Certyfikat musi być zarejestrowany w KSeF i mieć przypisane uprawnienia do podmiotu (NIP)
 - Generowanie PDF wymaga pobrania pełnego XML faktury z KSeF (dodatkowe zapytania API)
-- PDF jest generowany na podstawie schematu FA (3) - głównego formatu faktur KSeF
+- PDF jest generowany na podstawie schematów FA(2) i FA(3) KSeF
+- Kod QR na PDF zawiera URL weryfikacyjny odpowiedni dla wybranego środowiska (`--env`)
 
 ## Rozwiązywanie problemów
 
