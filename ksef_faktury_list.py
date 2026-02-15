@@ -1113,24 +1113,39 @@ class InvoicePDFGenerator:
                 data['period_to'] = okres.findtext('P_6_Do', '')
 
             # Summary totals - collect all VAT rates
+            # P_13_1 = stawka podstawowa (23%/22%), P_13_2 = obniżona I (8%/7%),
+            # P_13_3 = obniżona II (5%), P_13_4 = ryczałt taksówki (4%/3%),
+            # P_13_5 = procedura OSS. Actual rate is calculated from amounts.
             vat_rate_fields = [
-                ('P_13_1', 'P_14_1', 'P_14_1W', '23%'),
-                ('P_13_2', 'P_14_2', 'P_14_2W', '22%'),
-                ('P_13_3', 'P_14_3', 'P_14_3W', '8%'),
-                ('P_13_4', 'P_14_4', 'P_14_4W', '7%'),
-                ('P_13_5', 'P_14_5', 'P_14_5W', '5%'),
-                ('P_13_6_1', None, None, '0%'),
-                ('P_13_6_2', None, None, '0% (WDT)'),
-                ('P_13_6_3', None, None, '0% (eksport)'),
-                ('P_13_7', None, None, 'zw'),
-                ('P_13_8', None, None, 'np'),
+                ('P_13_1', 'P_14_1', 'P_14_1W'),
+                ('P_13_2', 'P_14_2', 'P_14_2W'),
+                ('P_13_3', 'P_14_3', 'P_14_3W'),
+                ('P_13_4', 'P_14_4', 'P_14_4W'),
+                ('P_13_5', 'P_14_5', 'P_14_5W'),
+                ('P_13_6_1', None, None),
+                ('P_13_6_2', None, None),
+                ('P_13_6_3', None, None),
+                ('P_13_7', None, None),
+                ('P_13_8', None, None),
             ]
+            # Fixed labels for fields without calculable rate
+            fixed_labels = {
+                'P_13_6_1': '0%', 'P_13_6_2': '0% (WDT)', 'P_13_6_3': '0% (eksport)',
+                'P_13_7': 'zw', 'P_13_8': 'np',
+            }
             rates = []
-            for net_field, vat_field, vat_conv_field, label in vat_rate_fields:
+            for net_field, vat_field, vat_conv_field in vat_rate_fields:
                 net = self._parse_amount(fa.findtext(net_field, ''))
                 vat = self._parse_amount(fa.findtext(vat_field, '')) if vat_field else 0.0
                 vat_conv = self._parse_amount(fa.findtext(vat_conv_field, '')) if vat_conv_field else 0.0
                 if net:
+                    if net_field in fixed_labels:
+                        label = fixed_labels[net_field]
+                    elif net and vat:
+                        pct = round(vat / net * 100)
+                        label = f'{pct}%'
+                    else:
+                        label = '0%'
                     rates.append({'label': label, 'net': net, 'vat': vat, 'vat_converted': vat_conv})
             data['summary'] = {
                 'rates': rates,
