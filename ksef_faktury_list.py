@@ -960,7 +960,7 @@ class KSeFClient:
 
         return self._make_request('POST', endpoint, data=data, with_session=True)
 
-    def get_invoice_xml(self, ksef_number: str) -> str:
+    def get_invoice_xml(self, ksef_number: str) -> bytes:
         """
         Download invoice XML from KSeF.
 
@@ -968,7 +968,7 @@ class KSeFClient:
             ksef_number: KSeF invoice number
 
         Returns:
-            Invoice XML as string
+            Invoice XML as raw bytes (preserving original encoding for QR hash)
         """
         if not self.access_token:
             raise KSeFError("No active session")
@@ -985,7 +985,7 @@ class KSeFClient:
                 status_code=response.status_code
             )
 
-        return response.text
+        return response.content
 
 
 class InvoicePDFGenerator:
@@ -1239,7 +1239,7 @@ class InvoicePDFGenerator:
         """Format amount for display."""
         return f"{amount:,.2f} {currency}".replace(',', ' ').replace('.', ',').replace(' ', ' ')
 
-    def _generate_qr_image(self, xml_content: str, seller_nip: str,
+    def _generate_qr_image(self, xml_raw: bytes, seller_nip: str,
                            invoice_date: str, environment: str = 'prod') -> io.BytesIO:
         """
         Generate QR code image for KSeF invoice verification.
@@ -1248,7 +1248,7 @@ class InvoicePDFGenerator:
         {base_url}/invoice/{seller_nip}/{DD-MM-YYYY}/{SHA256_base64url}
 
         Args:
-            xml_content: Original invoice XML content (used for SHA-256 hash)
+            xml_raw: Original invoice XML as raw bytes (used for SHA-256 hash)
             seller_nip: Seller's NIP number
             invoice_date: Invoice date in YYYY-MM-DD format (from P_1)
             environment: KSeF environment ('test', 'demo', 'prod')
@@ -1256,9 +1256,8 @@ class InvoicePDFGenerator:
         Returns:
             BytesIO buffer containing QR code PNG image
         """
-        # SHA-256 hash of XML content, Base64URL encoded
-        xml_bytes = xml_content.encode('utf-8')
-        sha256_hash = hashlib.sha256(xml_bytes).digest()
+        # SHA-256 hash of original XML bytes, Base64URL encoded
+        sha256_hash = hashlib.sha256(xml_raw).digest()
         hash_b64url = base64.urlsafe_b64encode(sha256_hash).rstrip(b'=').decode('ascii')
 
         # Convert date from YYYY-MM-DD to DD-MM-YYYY
@@ -1287,15 +1286,18 @@ class InvoicePDFGenerator:
         return buf
 
     def generate_pdf(self, xml_content: str, output_path: str,
-                     environment: str = 'prod', ksef_number: str = None) -> str:
+                     environment: str = 'prod', ksef_number: str = None,
+                     xml_raw_bytes: bytes = None) -> str:
         """
         Generate PDF from KSeF XML invoice.
 
         Args:
-            xml_content: Invoice XML content
+            xml_content: Invoice XML content (str, for parsing)
             output_path: Path to save PDF file
             environment: KSeF environment for QR code URL ('test', 'demo', 'prod')
             ksef_number: KSeF reference number (displayed below QR code)
+            xml_raw_bytes: Original XML bytes from KSeF (for SHA-256 QR hash).
+                           If None, xml_content.encode('utf-8') is used as fallback.
 
         Returns:
             Path to generated PDF
@@ -1519,7 +1521,8 @@ class InvoicePDFGenerator:
         invoice_date = data.get('invoice_date', '')
         if seller_nip and invoice_date:
             try:
-                qr_buf = self._generate_qr_image(xml_content, seller_nip, invoice_date, environment)
+                qr_raw = xml_raw_bytes if xml_raw_bytes is not None else xml_content.encode('utf-8')
+                qr_buf = self._generate_qr_image(qr_raw, seller_nip, invoice_date, environment)
                 qr_img = Image(qr_buf, width=30*mm, height=30*mm)
 
                 ksef_label = ksef_number if ksef_number else ''
@@ -1624,7 +1627,7 @@ def send_invoice_email(
         subject: Email subject
         invoice_number: Invoice number (for email body)
         ksef_number: KSeF number (for email body and attachment filenames)
-        xml_content: Invoice XML content string (optional)
+        xml_content: Invoice XML content (bytes or str, optional)
         pdf_path: Path to invoice PDF file (optional)
     """
     logger.info(f"Przygotowywanie emaila dla faktury {invoice_number} (KSeF: {ksef_number})")
@@ -1652,7 +1655,7 @@ def send_invoice_email(
         logger.warning(f"  Brak załącznika PDF (ścieżka: {pdf_path})")
 
     if xml_content:
-        xml_bytes = xml_content.encode('utf-8')
+        xml_bytes = xml_content if isinstance(xml_content, bytes) else xml_content.encode('utf-8')
         xml_attachment = MIMEApplication(xml_bytes, _subtype='xml')
         xml_attachment.add_header('Content-Disposition', 'attachment', filename=f"{safe_name}.xml")
         msg.attach(xml_attachment)
@@ -1717,7 +1720,8 @@ def send_grouped_email(
             logger.info(f"  Dołączono PDF: {safe_name}.pdf ({len(pdf_data)} bajtów)")
 
         if inv.get('xml_content'):
-            xml_bytes = inv['xml_content'].encode('utf-8')
+            xml_data = inv['xml_content']
+            xml_bytes = xml_data if isinstance(xml_data, bytes) else xml_data.encode('utf-8')
             xml_attachment = MIMEApplication(xml_bytes, _subtype='xml')
             xml_attachment.add_header('Content-Disposition', 'attachment', filename=f"{safe_name}.xml")
             msg.attach(xml_attachment)
@@ -1862,13 +1866,15 @@ Examples:
         err_count = 0
         for xml_file in xml_files:
             try:
-                with open(xml_file, 'r', encoding='utf-8') as f:
-                    xml_content = f.read()
+                with open(xml_file, 'rb') as f:
+                    xml_raw = f.read()
+                xml_content = xml_raw.decode('utf-8')
 
                 base_name = os.path.splitext(os.path.basename(xml_file))[0]
                 pdf_path = os.path.join(pdf_output_dir, f"{base_name}.pdf")
                 pdf_generator.generate_pdf(xml_content, pdf_path,
-                                           environment=args.env, ksef_number=base_name)
+                                           environment=args.env, ksef_number=base_name,
+                                           xml_raw_bytes=xml_raw)
                 print(f"  OK: {xml_file} -> {pdf_path}")
                 ok_count += 1
             except Exception as e:
@@ -1992,7 +1998,7 @@ Examples:
             print_invoices_table(invoices)
 
         # Caches to avoid duplicate KSeF API calls across download-xml, download-pdf, and send-email
-        xml_cache = {}   # ksef_number -> xml_content
+        xml_cache = {}   # ksef_number -> xml raw bytes
         pdf_cache = {}   # ksef_number -> pdf_path
 
         def get_xml_cached(ksef_number):
@@ -2009,12 +2015,12 @@ Examples:
                 ksef_number = inv.get('ksefNumber')
                 if ksef_number:
                     try:
-                        xml_content = get_xml_cached(ksef_number)
+                        xml_raw = get_xml_cached(ksef_number)
                         # Sanitize filename
                         safe_name = ksef_number.replace('/', '_').replace('\\', '_')
                         filepath = os.path.join(args.xml_output_dir, f"{safe_name}.xml")
-                        with open(filepath, 'w', encoding='utf-8') as f:
-                            f.write(xml_content)
+                        with open(filepath, 'wb') as f:
+                            f.write(xml_raw)
                         print(f"  Pobrano: {filepath}")
                     except KSeFError as e:
                         print(f"  Błąd pobierania {ksef_number}: {e.message}", file=sys.stderr)
@@ -2029,12 +2035,14 @@ Examples:
                 ksef_number = inv.get('ksefNumber')
                 if ksef_number:
                     try:
-                        xml_content = get_xml_cached(ksef_number)
+                        xml_raw = get_xml_cached(ksef_number)
+                        xml_text = xml_raw.decode('utf-8')
                         # Sanitize filename
                         safe_name = ksef_number.replace('/', '_').replace('\\', '_')
                         filepath = os.path.join(args.pdf_output_dir, f"{safe_name}.pdf")
-                        pdf_generator.generate_pdf(xml_content, filepath,
-                                                   environment=args.env, ksef_number=ksef_number)
+                        pdf_generator.generate_pdf(xml_text, filepath,
+                                                   environment=args.env, ksef_number=ksef_number,
+                                                   xml_raw_bytes=xml_raw)
                         pdf_cache[ksef_number] = filepath
                         print(f"  Wygenerowano: {filepath}")
                     except KSeFError as e:
@@ -2091,8 +2099,8 @@ Examples:
                             logger.warning(f"Pomijanie faktury bez numeru KSeF: {inv}")
                             continue
                         try:
-                            xml_content = get_xml_cached(ksef_number)
-                            logger.info(f"  Pobrano XML dla {ksef_number} ({len(xml_content)} bajtów)")
+                            xml_raw = get_xml_cached(ksef_number)
+                            logger.info(f"  Pobrano XML dla {ksef_number} ({len(xml_raw)} bajtów)")
                         except KSeFError as e:
                             print(f"  Błąd pobierania XML dla {ksef_number}: {e.message}", file=sys.stderr)
                             continue
@@ -2104,8 +2112,10 @@ Examples:
                             try:
                                 tmp = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
                                 tmp.close()
-                                pdf_generator_email.generate_pdf(xml_content, tmp.name,
-                                                                 environment=args.env, ksef_number=ksef_number)
+                                xml_text = xml_raw.decode('utf-8')
+                                pdf_generator_email.generate_pdf(xml_text, tmp.name,
+                                                                 environment=args.env, ksef_number=ksef_number,
+                                                                 xml_raw_bytes=xml_raw)
                                 pdf_path = tmp.name
                                 pdf_cache[ksef_number] = pdf_path
                                 temp_pdfs.append(tmp.name)
@@ -2118,7 +2128,7 @@ Examples:
                         invoices_data.append({
                             'invoice_number': invoice_number,
                             'ksef_number': ksef_number,
-                            'xml_content': xml_content,
+                            'xml_content': xml_raw,
                             'pdf_path': pdf_path,
                         })
 
@@ -2154,8 +2164,8 @@ Examples:
                         logger.info(f"Przetwarzanie faktury {idx}/{len(invoices)}: {invoice_number} ({ksef_number})")
 
                         try:
-                            xml_content = get_xml_cached(ksef_number)
-                            logger.info(f"  Pobrano XML dla {ksef_number} ({len(xml_content)} bajtów)")
+                            xml_raw = get_xml_cached(ksef_number)
+                            logger.info(f"  Pobrano XML dla {ksef_number} ({len(xml_raw)} bajtów)")
                         except KSeFError as e:
                             print(f"  Błąd pobierania XML dla {ksef_number}: {e.message}", file=sys.stderr)
                             err_count += 1
@@ -2168,8 +2178,10 @@ Examples:
                             try:
                                 tmp = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
                                 tmp.close()
-                                pdf_generator_email.generate_pdf(xml_content, tmp.name,
-                                                                 environment=args.env, ksef_number=ksef_number)
+                                xml_text = xml_raw.decode('utf-8')
+                                pdf_generator_email.generate_pdf(xml_text, tmp.name,
+                                                                 environment=args.env, ksef_number=ksef_number,
+                                                                 xml_raw_bytes=xml_raw)
                                 pdf_path = tmp.name
                                 pdf_cache[ksef_number] = pdf_path
                                 temp_pdfs.append(tmp.name)
@@ -2191,7 +2203,7 @@ Examples:
                                 subject=subject,
                                 invoice_number=invoice_number,
                                 ksef_number=ksef_number,
-                                xml_content=xml_content,
+                                xml_content=xml_raw,
                                 pdf_path=pdf_path,
                             )
                             sent_count += 1
